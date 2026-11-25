@@ -748,5 +748,101 @@ console.log('14. Testing bug-fix regressions: height compose no-double, smin val
   assert.match(lintOut, /\[noise\] 1 isolated pixel\(s\): 8,8/);
 }
 
+// ── 15. Bloco 3: state save/load, include, dump halfblock/luma, bounds, probe, sheet, lint extensions
+console.log('15. Bloco 3: state, include, dump halfblock/luma, bounds, probe, sheet, lint JSON/overlay');
+{
+  const ptxsFile = path.join(SCRATCH, 'state_test.ptxs');
+  const incFile = path.join(SCRATCH, 'inc_part.ptx');
+  const circA = path.join(SCRATCH, 'circ_a.ptx');
+  const circB = path.join(SCRATCH, 'circ_b.ptx');
+  const sheetPng = path.join(SCRATCH, 'sheet_out.png');
+  const cliSheetPng = path.join(SCRATCH, 'cli_sheet.png');
+  const overlayPng = path.join(SCRATCH, 'lint_overlay.png');
+  const verifyPng = path.join(SCRATCH, 'state_verify.png');
+
+  fs.writeFileSync(incFile, `
+    shape badge new
+    shape badge add ellipse 16 16 6 6
+    shape badge fill rust:10
+    height ellipse 16 16 6 6 4 fill soft
+  `);
+  fs.writeFileSync(circA, `include circ_b.ptx\n`);
+  fs.writeFileSync(circB, `include circ_a.ptx\n`);
+
+  // A) include + state save + dump halfblock/luma + bounds + probe + sheet
+  const outA = runPTX(`
+    palette quake
+    new 32 32 slate:2
+    include "${incFile.replace(/\\/g, '/')}"
+    anchor center 16 16
+    layer new detail
+    pixel 16 16 fb_lava:4
+    bounds bg=slate:2
+    probe 16 16
+    dump view=luma scale=2
+    dump halfblock scale=2
+    sheet "${sheetPng.replace(/\\/g, '/')}" scale=3
+    state save "${ptxsFile.replace(/\\/g, '/')}"
+  `);
+  assert.match(outA, /ok: .* 0 warning\(s\)/);
+  assert.match(outA, /bounds: x=10 y=10 w=13 h=13/);
+  assert.match(outA, /probe 16,16: idx=228 .* \[FB\] h=4\.00 layer=detail shapes=\[badge\]/);
+  assert.match(outA, /luma view 32x32 \(scale=2 -> 16x16\)/);
+  assert.match(outA, /\u2580/);
+  assert.ok(fs.existsSync(sheetPng), 'sheet PNG created');
+  const sheetBuf = fs.readFileSync(sheetPng);
+  assert.equal(sheetBuf.readUInt32BE(0), 0x89504e47, 'sheet is valid PNG');
+  assert.equal(sheetBuf[25], 2, 'sheet is RGB PNG (color type 2)');
+
+  // B) state load in a fresh process preserves px, hmap, layers, shapes, anchors
+  const outB = runPTX(`
+    state load "${ptxsFile.replace(/\\/g, '/')}"
+    probe 16 16
+    probe 12 16
+    shape badge show
+    save "${verifyPng.replace(/\\/g, '/')}"
+  `);
+  assert.match(outB, /state loaded:/);
+  assert.match(outB, /probe 16,16: idx=228 .* \[FB\] h=4\.00 layer=detail shapes=\[badge\]/);
+  assert.match(outB, /probe 12,16: .* ramp=rust:10/);
+  const imVerify = readPNGInfo(verifyPng);
+  assert.equal(imVerify.px[16 * 32 + 16], 228, 'loaded state preserved fullbright pixel');
+  assert.equal(imVerify.px[16 * 32 + 12], 5 * 16 + 10, 'loaded state preserved rust:10 pixel');
+
+  // C) circular include fails cleanly
+  assert.throws(() => runPTX(`include "${circA.replace(/\\/g, '/')}"\n`), (err) => {
+    assert.match(String(err.stdout || '') + String(err.stderr || '') + err.message, /circular include/);
+    return true;
+  }, 'circular include exits non-zero');
+
+  // D) lint histogram, json, overlay, repeat detection, and CLI --sheet
+  const lintJsonOut = runPTX(`
+    palette quake
+    new 32 32 slate:6
+    # Periodic 8px horizontal stripes -> triggers [repeat] at dx=8
+    rect 0 0 2 32 slate:14 fill
+    rect 8 0 2 32 slate:14 fill
+    rect 16 0 2 32 slate:14 fill
+    rect 24 0 2 32 slate:14 fill
+    pixel 4 4 slate:15
+    lint json overlay="${overlayPng.replace(/\\/g, '/')}"
+  `);
+  assert.ok(fs.existsSync(overlayPng), 'lint overlay PNG created');
+  const jsonLine = lintJsonOut.split(/\r?\n/).find((l) => l.trim().startsWith('{'));
+  assert.ok(jsonLine, 'lint json emitted JSON line');
+  const parsed = JSON.parse(jsonLine);
+  assert.ok(parsed.isolated.length >= 1, 'JSON reports isolated noise pixel');
+  assert.ok(parsed.histogram && parsed.histogram.zones.length === 5, 'JSON includes 5-zone tonal histogram');
+  assert.ok(parsed.repetition && parsed.repetition.dx === 8, `JSON detected repetition at dx=8 (got ${JSON.stringify(parsed.repetition)})`);
+
+  // E) CLI --sheet flag
+  const cliScript = path.join(SCRATCH, 'cli_sheet_test.ptx');
+  fs.writeFileSync(cliScript, `new 16 16 stone:8\nrect 2 2 12 12 stone:14 fill\n`);
+  const cliRes = execFileSync(process.execPath, [PALTEX, cliScript, '--sheet', cliSheetPng], { encoding: 'utf8' });
+  assert.match(cliRes, /sheet saved:/);
+  assert.ok(fs.existsSync(cliSheetPng), '--sheet CLI flag created contact sheet PNG');
+}
+
+
 fs.rmSync(SCRATCH, { recursive: true, force: true });
 console.log('ALL TESTS PASSED!');

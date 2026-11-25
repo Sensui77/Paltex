@@ -305,17 +305,24 @@ sym off
 
 ---
 
-## 8. Inspeção, Trace Visual e Lint
+## 8. Inspeção, Trace Visual, Estado e Lint
 
-- `dump [view=char|idx|step|height] [region=x,y,w,h|anchor:nome]` e `zoom <x> <y> <w> <h> [view=char|idx|step|height]` — inspecione silhuetas em 2 cores chapadas (ou `shape show`) em ASCII antes de partir para `height`/`light`.
+- `dump [view=char|idx|step|height|luma|halfblock] [scale=N] [region=x,y,w,h|anchor:nome]` e `zoom <x> <y> <w> <h> [view=...] [scale=N]` — inspecione silhuetas em ASCII, mapa de luminância (`view=luma`), minimapa ANSI truecolor (`halfblock`) ou relevo (`height`), opcionalmente reduzido com `scale=N`.
+- `bounds [bg=<cor>] [shape=…] [mask=…] [region=…]`: retorna a caixa delimitadora exata e a cobertura dos pixels não-fundo.
+- `probe <x> <y>`: inspeciona um pixel único (índice, hex, RGB, luminância, `rampa:passo`, altura `hmap`, camada ativa e `shapes`).
+- `state save <arquivo.ptxs>` / `state load <arquivo.ptxs>`: serializa ou restaura todo o estado binário (canvas, `hmap`, camadas, paleta, rampas, `shapes`, âncoras e sprites) entre execuções.
+- `include <arquivo.ptx>`: executa comandos de outro script `.ptx` no estado atual (com detecção de ciclo).
+- `sheet <arquivo.png> [scale=3] [pad=8]` (ou flag CLI `--sheet <arquivo.png>`): gera uma folha de contato RGB PNG com **1×**, **N× com réguas**, **2×2 tiled** e **mapa de altura**.
 - `seam`: mede o salto médio de cor nas bordas `x` e `y` comparado ao interior do tile.
 - `info`: exibe dimensões, `wrap`, `sym`, quantidade de camadas, paleta, chaves, sprites e pincel ativo.
-- `lint [mask=] [region=] [jump=3]`:
+- `lint [mask=] [region=] [jump=3] [histogram] [json] [overlay=<arquivo.png>]` (ou flag CLI `--json`):
   - `[noise]`: pixels isolados (excluindo dithers regulares e linhas finas)
   - `[dither]`: blocos grandes (`>= 36 px`) de padrão 2×2 repetitivo
   - `[banding]`: saltos intra-rampa `> jump` entre vizinhos adjacentes
   - `[ramp]`: pequenas manchas (`<= 3 px`) de uma rampa perdidas dentro de outra rampa dominante
   - `[unramped]`: pixels não-fullbright sem rampa associada
+  - `[histogram]`, `[readability]` e `[repeat]`: distribuição tonal em 5 zonas, legibilidade em escala 1/4 e detecção de repetição periódica por autocorrelação
+  - `overlay=<arquivo.png>`: salva PNG RGB anotado destacando os problemas encontrados
   - Executa `seam` automaticamente no canvas inteiro.
 - `save <arquivo.png> [scale=N] [tile=N]`: exporta PNG indexado 8-bit com paleta embutida.
 

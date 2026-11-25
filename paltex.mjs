@@ -3,6 +3,7 @@
 // Zero dependencies, single file, Node >= 16.   Usage: node paltex.mjs help
 // Everything is an 8-bit INDEXED canvas: no operation can ever create a color outside the palette.
 import fs from 'node:fs';
+import path from 'node:path';
 import zlib from 'node:zlib';
 
 // ─────────────────────────────────────────────────────────────── state & helpers
@@ -23,6 +24,7 @@ const S = {
   albedo: null, albedoLayer: -1, lightAccum: null, lastLights: [],
   undoStack: [], undoBytes: 0, checkpoints: new Map(), lastDiff: null,
   trace: { active: false, dir: null, scale: 4, pad: 4, all: false, step: 0 },
+  includeStack: [], sheetOut: null, json: false,
 };
 const out = (s = '') => process.stdout.write(s + '\n');
 process.stdout.on('error', (e) => { if (e.code !== 'EPIPE') throw e; }); // "| head" must not kill the script (it may still have to save)
@@ -293,6 +295,16 @@ function encodePNG(w, h, px, pal) {
   const raw = Buffer.alloc((w + 1) * h);
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) raw[y * (w + 1) + 1 + x] = px[y * w + x];
   return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('PLTE', Buffer.from(pal.flat())), chunk('IDAT', zlib.deflateSync(raw, { level: 9 })), chunk('IEND', Buffer.alloc(0))]);
+}
+function encodeRGBPNG(w, h, rgb) {
+  const ihdr = Buffer.alloc(13); ihdr.writeUInt32BE(w, 0); ihdr.writeUInt32BE(h, 4); ihdr[8] = 8; ihdr[9] = 2;
+  const stride = w * 3 + 1, raw = Buffer.alloc(stride * h);
+  for (let y = 0; y < h; y++) {
+    const rowOff = y * stride, srcOff = y * w * 3;
+    raw[rowOff] = 0;
+    for (let i = 0; i < w * 3; i++) raw[rowOff + 1 + i] = rgb[srcOff + i];
+  }
+  return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw, { level: 9 })), chunk('IEND', Buffer.alloc(0))]);
 }
 function decodePNG(buf) {
   if (buf.length < 8 || buf.readUInt32BE(0) !== 0x89504e47) fail('not a PNG file');
@@ -2782,34 +2794,83 @@ function legend(used) {
   for (const c of [...used.keys()].sort((a, b) => ord(a) - ord(b))) out(`  ${S.keyOf.get(c) ?? '?'} = ${descr(c)}  x${used.get(c)}`);
   if ([...used.keys()].some((c) => !S.keyOf.has(c))) out('  (? = ran out of key chars; use view=idx)');
 }
-function show(x0, y0, w, h, view = 'char', cw = 1) {
+const LUMA_RAMP = ' .:-=+*#%@';
+function blockAvgRGB(x0, y0, scale) {
+  let r = 0, g = 0, b = 0, n = 0;
+  for (let dy = 0; dy < scale; dy++) for (let dx = 0; dx < scale; dx++) {
+    const c = S.px[mod(y0 + dy, S.h) * S.w + mod(x0 + dx, S.w)];
+    const rgb = S.pal[c] || [0, 0, 0];
+    r += rgb[0]; g += rgb[1]; b += rgb[2]; n++;
+  }
+  return [Math.round(r / n), Math.round(g / n), Math.round(b / n)];
+}
+function show(x0, y0, w, h, view = 'char', cw = 1, scale = 1) {
   needCanvas();
   if (w < 1 || h < 1 || w > 512 || h > 512) fail('view width/height must be 1..512');
-  if (!['char', 'idx', 'step', 'height'].includes(view)) fail('view must be char | idx | step | height');
-  const xs = Array.from({ length: w }, (_, i) => mod(x0 + i, S.w)), pad = String(S.h - 1).length;
-  out(`${view} view ${w}x${h} at ${x0},${y0} — canvas ${S.w}x${S.h}, wrap ${S.wrap ? 'on' : 'off'}; rulers show wrapped x (top) and y (left)`);
+  if (!['char', 'idx', 'step', 'height', 'luma', 'halfblock'].includes(view)) fail('view must be char | idx | step | height | luma | halfblock');
+  scale = clamp(Math.round(scale), 1, 32);
+  const sw = Math.max(1, Math.floor(w / scale)), sh = Math.max(1, Math.floor(h / scale));
+  const xs = Array.from({ length: sw }, (_, i) => mod(x0 + i * scale, S.w)), pad = String(S.h - 1).length;
+  out(`${view} view ${w}x${h}${scale > 1 ? ` (scale=${scale} -> ${sw}x${sh})` : ''} at ${x0},${y0} — canvas ${S.w}x${S.h}, wrap ${S.wrap ? 'on' : 'off'}`);
+  if (view === 'halfblock') {
+    for (let j = 0; j < sh; j += 2) {
+      let row = String(mod(y0 + j * scale, S.h)).padStart(pad) + ' ';
+      const hasBot = j + 1 < sh;
+      for (let i = 0; i < sw; i++) {
+        const [r1, g1, b1] = blockAvgRGB(x0 + i * scale, y0 + j * scale, scale);
+        if (hasBot) {
+          const [r2, g2, b2] = blockAvgRGB(x0 + i * scale, y0 + (j + 1) * scale, scale);
+          row += `\x1b[38;2;${r1};${g1};${b1}m\x1b[48;2;${r2};${g2};${b2}m\u2580`;
+        } else {
+          row += `\x1b[38;2;${r1};${g1};${b1}m\u2580`;
+        }
+      }
+      out(row + '\x1b[0m');
+    }
+    return;
+  }
+  if (view === 'luma') {
+    for (let d = String(S.w - 1).length - 1; d >= 0; d--) out(' '.repeat(pad + 1) + xs.map((x, i) => (d === 0 || x % 10 === 0 || i === 0 ? Math.floor(x / 10 ** d) % 10 : ' ')).join(''));
+    for (let j = 0; j < sh; j++) {
+      out(String(mod(y0 + j * scale, S.h)).padStart(pad) + ' ' + xs.map((_, i) => {
+        const [r, g, b] = blockAvgRGB(x0 + i * scale, y0 + j * scale, scale);
+        const lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+        return LUMA_RAMP[clamp(Math.round(lum * (LUMA_RAMP.length - 1)), 0, LUMA_RAMP.length - 1)];
+      }).join(''));
+    }
+    out(`luma scale: "${LUMA_RAMP}" (dark -> bright)`);
+    return;
+  }
   if (view === 'height') {
     let minH = Infinity, maxH = -Infinity;
-    for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) { const hv = getH(x0 + i, y0 + j); if (hv < minH) minH = hv; if (hv > maxH) maxH = hv; }
+    const hGrid = new Float32Array(sw * sh);
+    for (let j = 0; j < sh; j++) for (let i = 0; i < sw; i++) {
+      let sum = 0;
+      for (let dy = 0; dy < scale; dy++) for (let dx = 0; dx < scale; dx++) sum += getH(x0 + i * scale + dx, y0 + j * scale + dy);
+      const hv = sum / (scale * scale);
+      hGrid[j * sw + i] = hv;
+      if (hv < minH) minH = hv; if (hv > maxH) maxH = hv;
+    }
     const span = maxH - minH || 1;
     for (let d = String(S.w - 1).length - 1; d >= 0; d--) out(' '.repeat(pad + 1) + xs.map((x, i) => (d === 0 || x % 10 === 0 || i === 0 ? Math.floor(x / 10 ** d) % 10 : ' ')).join(''));
-    for (let j = 0; j < h; j++) {
-      out(String(mod(y0 + j, S.h)).padStart(pad) + ' ' + xs.map((_, i) => {
-        const hv = getH(x0 + i, y0 + j);
+    for (let j = 0; j < sh; j++) {
+      out(String(mod(y0 + j * scale, S.h)).padStart(pad) + ' ' + xs.map((_, i) => {
+        const hv = hGrid[j * sw + i];
         return maxH === minH ? '0' : Math.round(((hv - minH) / span) * 35).toString(36);
       }).join(''));
     }
     out(`height range: ${minH.toFixed(2)} .. ${maxH.toFixed(2)} (0=min .. z=max)`);
     return;
   }
-  const at = (x, y) => S.px[mod(y, S.h) * S.w + mod(x, S.w)], used = new Map();
-  for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) { const c = at(x0 + i, y0 + j); used.set(c, (used.get(c) || 0) + 1); }
+  const off = Math.floor(scale / 2);
+  const at = (x, y) => S.px[mod(y + off, S.h) * S.w + mod(x + off, S.w)], used = new Map();
+  for (let j = 0; j < sh; j++) for (let i = 0; i < sw; i++) { const c = at(x0 + i * scale, y0 + j * scale); used.set(c, (used.get(c) || 0) + 1); }
   autoKeys([...used.keys()]);
   if (view === 'idx') cw = 4;
   const cell = (c) => (view === 'idx' ? String(c) : view === 'step' ? (S.rampOf[c] ? S.rampOf[c].i.toString(36) : '?') : S.keyOf.get(c) ?? '?').padStart(cw);
   if (cw === 1) for (let d = String(S.w - 1).length - 1; d >= 0; d--) out(' '.repeat(pad + 1) + xs.map((x, i) => (d === 0 || x % 10 === 0 || i === 0 ? Math.floor(x / 10 ** d) % 10 : ' ')).join(''));
   else out(' '.repeat(pad + 1) + xs.map((x) => String(x).padStart(cw)).join(''));
-  for (let j = 0; j < h; j++) out(String(mod(y0 + j, S.h)).padStart(pad) + ' ' + xs.map((_, i) => cell(at(x0 + i, y0 + j))).join(''));
+  for (let j = 0; j < sh; j++) out(String(mod(y0 + j * scale, S.h)).padStart(pad) + ' ' + xs.map((_, i) => cell(at(x0 + i * scale, y0 + j * scale))).join(''));
   if (view === 'step') out('(digits = step inside the pixel\'s ramp, base 36, 0 = darkest; ? = color in no ramp)');
   legend(used);
 }
@@ -2883,6 +2944,216 @@ function saveTrace(beforePx, cmdLabel) {
   const file = `${S.trace.dir}/${String(++S.trace.step).padStart(3, '0')}_${safe}.png`;
   fs.writeFileSync(file, encodePNG(ow, oh, outPx, S.pal));
   out(`trace: ${file} (${cw}x${ch} at ${mod(cx, S.w)},${mod(cy, S.h)}, ${b.count} px changed, ${sc}x)`);
+}
+const TYPED_ARRAYS = { Uint8Array, Int8Array, Int16Array, Int32Array, Float32Array };
+function savePtxs(file) {
+  needCanvas();
+  const meta = {
+    w: S.w, h: S.h, wrap: S.wrap, hchanged: S.hchanged, changed: S.changed,
+    sym: S.sym, activeLayer: S.activeLayer, albedoLayer: S.albedoLayer, activeShape: S.activeShape,
+    pal: S.pal, fullbright: Array.from(S.fullbright),
+    ramps: [...S.ramps.entries()],
+    autoRamps: [...autoRamps], aliasRamps: [...aliasRamps],
+    keys: [...S.keys.entries()],
+    anchors: [...S.anchors.entries()],
+    lastLights: S.lastLights.map(({ _warn, ...rest }) => rest),
+    sprites: [...S.sprites.entries()].map(([k, sp]) => [k, {
+      w: sp.w, h: sp.h, d: Array.from(sp.d), steps: sp.steps ? Array.from(sp.steps) : null,
+      rows: sp.rows, meta: sp.meta ? { ...sp.meta, overrides: sp.meta.overrides ? [...sp.meta.overrides.entries()] : [] } : null,
+    }]),
+    hasAlbedo: !!S.albedo,
+    layers: S.layers.map((l) => ({
+      name: l.name, kind: l.kind, visible: l.visible, hused: l.hused,
+      hmode: l.hmode, smoothR: l.smoothR, pxType: l.px.constructor.name,
+    })),
+    shapes: [...S.shapes.entries()].map(([k, v]) => [k, v.length]),
+  };
+  const jsonBuf = Buffer.from(JSON.stringify(meta), 'utf8');
+  const lenBuf = Buffer.alloc(4);
+  lenBuf.writeUInt32BE(jsonBuf.length, 0);
+  const parts = [lenBuf, jsonBuf];
+  const pushArr = (arr) => parts.push(Buffer.from(arr.buffer, arr.byteOffset, arr.byteLength));
+  pushArr(S.px);
+  pushArr(S.hmap);
+  if (S.albedo) pushArr(S.albedo);
+  for (const l of S.layers) { pushArr(l.px); pushArr(l.hmap); }
+  for (const [, buf] of S.shapes) pushArr(buf);
+  const body = zlib.deflateSync(Buffer.concat(parts), { level: 6 });
+  fs.writeFileSync(file, Buffer.concat([Buffer.from('PTXS\x01', 'latin1'), body]));
+  out(`state saved: ${file} (${S.w}x${S.h}, ${S.layers.length || 1} layer(s), ${S.shapes.size} shape(s), ${body.length + 5} bytes)`);
+}
+function loadPtxs(file) {
+  const raw = fs.readFileSync(file);
+  if (raw.length < 9 || raw.toString('latin1', 0, 4) !== 'PTXS') fail(`not a .ptxs state file: ${file}`);
+  if (raw[4] !== 1) fail(`unsupported .ptxs version ${raw[4]}`);
+  const payload = zlib.inflateSync(raw.subarray(5));
+  let off = 0;
+  const jsonLen = payload.readUInt32BE(off); off += 4;
+  const meta = JSON.parse(payload.subarray(off, off + jsonLen).toString('utf8')); off += jsonLen;
+  const takeArr = (Ctor, count) => {
+    const bytes = count * Ctor.BYTES_PER_ELEMENT;
+    const copy = new Uint8Array(payload.subarray(off, off + bytes));
+    off += bytes;
+    return new Ctor(copy.buffer);
+  };
+  initCanvas(meta.w, meta.h, 0);
+  setPalette(meta.pal);
+  S.wrap = !!meta.wrap; S.hchanged = meta.hchanged || 0; S.changed = meta.changed || 0;
+  S.sym = meta.sym || { mode: 'off', ax: null, ay: null, jitter: 0, seed: 0 };
+  S.activeLayer = meta.activeLayer ?? -1; S.albedoLayer = meta.albedoLayer ?? -1; S.activeShape = meta.activeShape ?? null;
+  S.fullbright = new Uint8Array(meta.fullbright || 256);
+  S.ramps.clear(); S.rampOf = []; autoRamps.clear(); aliasRamps.clear();
+  for (const r of (meta.autoRamps || [])) autoRamps.add(r);
+  for (const r of (meta.aliasRamps || [])) aliasRamps.add(r);
+  for (const [name, indices] of (meta.ramps || [])) {
+    S.ramps.set(name, indices);
+    if (!aliasRamps.has(name)) indices.forEach((c, i) => { S.rampOf[c] = { name, i, len: indices.length }; });
+  }
+  S.keys.clear(); S.keyOf.clear();
+  for (const [ch, idx] of (meta.keys || [])) setKey(ch, idx);
+  S.anchors = new Map(meta.anchors || []);
+  S.lastLights = meta.lastLights || [];
+  S.sprites = new Map((meta.sprites || []).map(([k, sp]) => [k, {
+    w: sp.w, h: sp.h, d: new Int16Array(sp.d), steps: sp.steps ? new Int16Array(sp.steps) : null,
+    rows: sp.rows, meta: sp.meta ? { ...sp.meta, overrides: new Map(sp.meta.overrides || []) } : null,
+  }]));
+  const nPx = S.w * S.h;
+  S.px = takeArr(Uint8Array, nPx);
+  S.hmap = takeArr(Float32Array, nPx);
+  S.albedo = meta.hasAlbedo ? takeArr(Uint8Array, nPx) : null;
+  S.layers = (meta.layers || []).map((l) => {
+    const Ctor = TYPED_ARRAYS[l.pxType] || Uint8Array;
+    return { name: l.name, kind: l.kind, visible: l.visible, hused: l.hused, hmode: l.hmode, smoothR: l.smoothR, px: takeArr(Ctor, nPx), hmap: takeArr(Float32Array, nPx) };
+  });
+  S.shapes = new Map((meta.shapes || []).map(([k, len]) => [k, takeArr(Uint8Array, len)]));
+  syncLayers();
+  out(`state loaded: ${file} (${S.w}x${S.h}, ${S.layers.length || 1} layer(s), ${S.shapes.size} shape(s))`);
+}
+function boundsCmd(o) {
+  needCanvas();
+  const bg = o.bg !== undefined ? col(o.bg, false) : 0;
+  const hasScope = !!(o.shape || o.mask || o.region);
+  const sc = hasScope ? scope(o) : null;
+  let minX = S.w, minY = S.h, maxX = -1, maxY = -1, count = 0;
+  for (let y = 0; y < S.h; y++) for (let x = 0; x < S.w; x++) {
+    const c = S.px[y * S.w + x];
+    const hit = sc ? sc.has(x, y) : c !== bg;
+    if (!hit) continue;
+    count++;
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (y < minY) minY = y; if (y > maxY) maxY = y;
+  }
+  if (!count) return out(`bounds: empty (0 px${sc ? '' : ` != ${descr(bg)}`})`);
+  const bw = maxX - minX + 1, bh = maxY - minY + 1;
+  const pct = ((count * 100) / (S.w * S.h)).toFixed(1);
+  out(`bounds: x=${minX} y=${minY} w=${bw} h=${bh} (x2=${maxX} y2=${maxY}), ${count} px (${pct}%)`);
+}
+function probeCmd(x, y) {
+  needCanvas();
+  const wx = S.wrap ? mod(x, S.w) : x, wy = S.wrap ? mod(y, S.h) : y;
+  if (wx < 0 || wy < 0 || wx >= S.w || wy >= S.h) fail(`probe (${x},${y}) out of bounds (${S.w}x${S.h})`);
+  const idx = wy * S.w + wx, c = S.px[idx], rgb = S.pal[c] || [0, 0, 0];
+  const lum = (0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2]) / 255;
+  const rm = S.rampOf[c];
+  const h = S.hmap[idx];
+  const inShapes = [];
+  for (const [nm, buf] of S.shapes) if (buf[idx]) inShapes.push(nm);
+  let layerInfo = '';
+  if (S.layers.length) {
+    let topLayer = S.layers[0].name;
+    for (let li = 1; li < S.layers.length; li++) {
+      const L = S.layers[li];
+      if (!L.visible) continue;
+      if (L.kind === 'paint' && L.px[idx] >= 0) topLayer = L.name;
+      else if (L.kind === 'shade' && L.px[idx] !== 0) topLayer += `+${L.name}(${L.px[idx] > 0 ? '+' : ''}${L.px[idx]})`;
+      else if (L.kind === 'base') topLayer = L.name;
+    }
+    layerInfo = ` layer=${topLayer}`;
+  }
+  out(`probe ${wx},${wy}: idx=${c} ${hex(rgb)} rgb(${rgb.join(',')}) luma=${lum.toFixed(2)} ramp=${rm ? `${rm.name}:${rm.i}/${rm.len - 1}` : '-'}${S.fullbright[c] ? ' [FB]' : ''} h=${h.toFixed(2)}${layerInfo}${inShapes.length ? ` shapes=[${inShapes.join(',')}]` : ''}`);
+}
+const FONT3X5 = {
+  '0': [7,5,5,5,7], '1': [2,6,2,2,7], '2': [7,1,7,4,7], '3': [7,1,7,1,7], '4': [5,5,7,1,1],
+  '5': [7,4,7,1,7], '6': [7,4,7,5,7], '7': [7,1,1,2,2], '8': [7,5,7,5,7], '9': [7,5,7,1,7],
+  'A': [2,5,7,5,5], 'B': [6,5,6,5,6], 'C': [7,4,4,4,7], 'D': [6,5,5,5,6], 'E': [7,4,6,4,7],
+  'F': [7,4,6,4,4], 'G': [7,4,5,5,7], 'H': [5,5,7,5,5], 'I': [7,2,2,2,7], 'J': [1,1,1,5,7],
+  'K': [5,5,6,5,5], 'L': [4,4,4,4,7], 'M': [5,7,7,5,5], 'N': [5,7,7,7,5], 'O': [7,5,5,5,7],
+  'P': [7,5,7,4,4], 'Q': [7,5,5,7,3], 'R': [7,5,6,5,5], 'S': [7,4,7,1,7], 'T': [7,2,2,2,2],
+  'U': [5,5,5,5,7], 'V': [5,5,5,5,2], 'W': [5,5,7,7,5], 'X': [5,5,2,5,5], 'Y': [5,5,2,2,2],
+  'Z': [7,1,2,4,7], ':': [0,2,0,2,0], '-': [0,0,7,0,0], '.': [0,0,0,0,2], ' ': [0,0,0,0,0],
+};
+function sheetCmd(file, o = {}) {
+  needCanvas();
+  const sc = clamp(num(o.scale, 3, 'scale'), 2, 8), pad = clamp(num(o.pad, 8, 'pad'), 2, 32);
+  const W = S.w, H = S.h, labelH = 9;
+  const p1w = W, p1h = H;
+  const p2w = W * sc, p2h = H * sc;
+  const p3w = W * 2, p3h = H * 2;
+  const p4w = W, p4h = H;
+  const topH = Math.max(p1h, p2h), botH = Math.max(p3h, p4h);
+  const outW = pad * 3 + Math.max(p1w + p2w, p3w + p4w) + 6;
+  const outH = pad * 3 + labelH * 2 + topH + botH + 6;
+  const rgb = new Uint8Array(outW * outH * 3);
+  for (let i = 0; i < outW * outH; i++) { rgb[i * 3] = 24; rgb[i * 3 + 1] = 24; rgb[i * 3 + 2] = 28; }
+  const setP = (x, y, r, g, b) => {
+    if (x < 0 || y < 0 || x >= outW || y >= outH) return;
+    const i = (y * outW + x) * 3; rgb[i] = r; rgb[i + 1] = g; rgb[i + 2] = b;
+  };
+  const drawText = (txt, x0, y0, r = 220, g = 220, b = 230) => {
+    let cx = x0;
+    for (const ch of txt.toUpperCase()) {
+      const gph = FONT3X5[ch] || FONT3X5[' '];
+      for (let row = 0; row < 5; row++) for (let col = 0; col < 3; col++) {
+        if ((gph[row] >> (2 - col)) & 1) setP(cx + col, y0 + row, r, g, b);
+      }
+      cx += 4;
+    }
+  };
+  const drawBorder = (x0, y0, w, h) => {
+    for (let x = x0 - 1; x <= x0 + w; x++) { setP(x, y0 - 1, 75, 75, 85); setP(x, y0 + h, 75, 75, 85); }
+    for (let y = y0 - 1; y <= y0 + h; y++) { setP(x0 - 1, y, 75, 75, 85); setP(x0 + w, y, 75, 75, 85); }
+  };
+  const blitCanvas = (x0, y0, w, h, s) => {
+    drawBorder(x0, y0, w, h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const c = S.px[mod(Math.floor(y / s), H) * W + mod(Math.floor(x / s), W)];
+      const [r, g, b] = S.pal[c] || [0, 0, 0];
+      setP(x0 + x, y0 + y, r, g, b);
+    }
+  };
+  // Panel 1: 1x
+  const x1 = pad, y1 = pad + labelH;
+  drawText(`1X ${W}X${H}`, x1, pad);
+  blitCanvas(x1, y1, p1w, p1h, 1);
+  // Panel 2: Nx zoomed with 8px ruler ticks
+  const x2 = pad * 2 + p1w, y2 = pad + labelH;
+  drawText(`${sc}X`, x2, pad);
+  blitCanvas(x2, y2, p2w, p2h, sc);
+  for (let gx = 8; gx < W; gx += 8) {
+    const col = gx % 16 === 0 ? [200, 200, 220] : [120, 120, 135];
+    setP(x2 + gx * sc, y2 - 2, ...col); setP(x2 + gx * sc, y2 - 3, ...col);
+  }
+  for (let gy = 8; gy < H; gy += 8) {
+    const col = gy % 16 === 0 ? [200, 200, 220] : [120, 120, 135];
+    setP(x2 - 2, y2 + gy * sc, ...col); setP(x2 - 3, y2 + gy * sc, ...col);
+  }
+  // Panel 3: 2x2 tiled
+  const x3 = pad, y3 = pad * 2 + labelH * 2 + topH;
+  drawText('2X2 TILE', x3, pad * 2 + labelH + topH);
+  blitCanvas(x3, y3, p3w, p3h, 1);
+  // Panel 4: Height map
+  const x4 = pad * 2 + p3w, y4 = y3;
+  drawText('HEIGHT', x4, pad * 2 + labelH + topH);
+  drawBorder(x4, y4, p4w, p4h);
+  let minH = Infinity, maxH = -Infinity;
+  for (let i = 0; i < W * H; i++) { if (S.hmap[i] < minH) minH = S.hmap[i]; if (S.hmap[i] > maxH) maxH = S.hmap[i]; }
+  const hSpan = maxH - minH || 1;
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const v = maxH === minH ? 128 : Math.round(((S.hmap[y * W + x] - minH) / hSpan) * 255);
+    setP(x4 + x, y4 + y, v, v, v);
+  }
+  fs.writeFileSync(file, encodeRGBPNG(outW, outH, rgb));
+  out(`sheet saved: ${file} (${outW}x${outH}px — 1x, ${sc}x, 2x2, height)`);
 }
 function lintCanvas(o) {
   needCanvas();
@@ -2973,18 +3244,111 @@ function lintCanvas(o) {
       outliers.push([comp[0][0], comp[0][1], myRamp, dom]);
     }
   });
+  // 4. Tonal histogram & low-res readability
+  const lumaBuf = new Float32Array(W * H);
+  const zones = [0, 0, 0, 0, 0];
+  let sumL = 0, minL = 255, maxL = 0, nPx = 0;
+  sc.each((x, y, c) => {
+    const wx = mod(x, W), wy = mod(y, H), rgb = S.pal[c] || [0, 0, 0];
+    const L = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2];
+    lumaBuf[wy * W + wx] = L;
+    zones[Math.min(4, Math.floor(L / 51.2))]++;
+    sumL += L; if (L < minL) minL = L; if (L > maxL) maxL = L; nPx++;
+  });
+  const meanL = nPx ? sumL / nPx : 0;
+  let varL = 0;
+  if (nPx) sc.each((x, y) => { const d = lumaBuf[mod(y, H) * W + mod(x, W)] - meanL; varL += d * d; });
+  const stdL = nPx ? Math.sqrt(varL / nPx) : 0;
+  let downStd = stdL;
+  if (W >= 16 && H >= 16 && !o.region && !o.mask) {
+    const dw = Math.floor(W / 4), dh = Math.floor(H / 4), dMean = meanL;
+    let dVar = 0, dn = 0;
+    for (let gy = 0; gy < dh; gy++) for (let gx = 0; gx < dw; gx++) {
+      let s = 0;
+      for (let dy = 0; dy < 4; dy++) for (let dx = 0; dx < 4; dx++) s += lumaBuf[(gy * 4 + dy) * W + (gx * 4 + dx)];
+      const dl = s / 16 - dMean;
+      dVar += dl * dl; dn++;
+    }
+    downStd = dn ? Math.sqrt(dVar / dn) : 0;
+  }
+  const lowReadability = stdL > 20 && downStd < 8;
+  // 5. Autocorrelation repetition detection (on full canvas when non-uniform)
+  let topRepeat = null;
+  if (!o.region && !o.mask && W >= 16 && H >= 16 && varL > 100) {
+    const step = W * H > 16384 ? 2 : 1;
+    let bestR = 0.85, bestLag = null;
+    const maxDx = Math.floor(W / 2), maxDy = Math.floor(H / 2);
+    const checkLag = (dx, dy) => {
+      let num = 0, den = 0;
+      for (let y = 0; y < H; y += step) for (let x = 0; x < W; x += step) {
+        const a = lumaBuf[y * W + x] - meanL;
+        const b = lumaBuf[mod(y + dy, H) * W + mod(x + dx, W)] - meanL;
+        num += a * b; den += a * a;
+      }
+      const r = den > 0 ? num / den : 0;
+      if (r > bestR) { bestR = r; bestLag = [dx, dy, r]; }
+    };
+    for (let dx = 4; dx <= maxDx; dx++) checkLag(dx, 0);
+    for (let dy = 4; dy <= maxDy; dy++) checkLag(0, dy);
+    if (bestLag) topRepeat = { dx: bestLag[0], dy: bestLag[1], corr: Number(bestLag[2].toFixed(3)) };
+  }
+  // Optional visual overlay PNG
+  if (o.overlay) {
+    const scO = 2, ow = W * scO, oh = H * scO, rgb = new Uint8Array(ow * oh * 3);
+    for (let y = 0; y < oh; y++) for (let x = 0; x < ow; x++) {
+      const c = S.px[Math.floor(y / scO) * W + Math.floor(x / scO)], col = S.pal[c] || [0, 0, 0];
+      const i = (y * ow + x) * 3;
+      rgb[i] = Math.round(col[0] * 0.65); rgb[i + 1] = Math.round(col[1] * 0.65); rgb[i + 2] = Math.round(col[2] * 0.65);
+    }
+    const mark = (x, y, r, g, b) => {
+      for (let dy = 0; dy < scO; dy++) for (let dx = 0; dx < scO; dx++) {
+        const i = ((y * scO + dy) * ow + (x * scO + dx)) * 3;
+        rgb[i] = r; rgb[i + 1] = g; rgb[i + 2] = b;
+      }
+    };
+    for (let i = 0; i < W * H; i++) if (ditherMask[i]) mark(i % W, (i / W) | 0, 255, 204, 0);
+    for (const [x, y] of unramped) mark(x, y, 255, 136, 0);
+    for (const [x, y] of jumps) mark(x, y, 0, 229, 255);
+    for (const [x, y] of outliers) mark(x, y, 255, 68, 255);
+    for (const [x, y] of isolated) mark(x, y, 255, 34, 68);
+    fs.writeFileSync(o.overlay, encodeRGBPNG(ow, oh, rgb));
+    if (!o.json && !S.json) out(`lint overlay: ${o.overlay} (${ow}x${oh}, red=noise yellow=dither cyan=banding magenta=ramp orange=unramped)`);
+  }
+  const seamStats = (!o.mask && !o.region) ? seam(true) : null;
+  const histogram = {
+    zones: zones.map((n) => (nPx ? Number(((n * 100) / nPx).toFixed(1)) : 0)),
+    min: Number(minL.toFixed(1)), max: Number(maxL.toFixed(1)),
+    mean: Number(meanL.toFixed(1)), std: Number(stdL.toFixed(1)),
+  };
+  const issues = (isolated.length ? 1 : 0) + (ditherPatches.length ? 1 : 0) + (jumps.length ? 1 : 0) + (outliers.length ? 1 : 0) + (unramped.length ? 1 : 0);
+  if (o.json || S.json) {
+    out(JSON.stringify({
+      issues,
+      isolated, ditherPatches, jumps, outliers, unramped,
+      histogram,
+      readability: { fullStd: Number(stdL.toFixed(2)), downStd: Number(downStd.toFixed(2)), lowReadability },
+      repetition: topRepeat,
+      seam: seamStats,
+    }));
+    return;
+  }
   const sample = (arr, fmt) => arr.slice(0, 5).map(fmt).join(', ') + (arr.length > 5 ? ` … (+${arr.length - 5})` : '');
-  let issues = 0;
   out('lint report:');
-  if (isolated.length) { issues++; out(`  [noise] ${isolated.length} isolated pixel(s): ${sample(isolated, ([x, y]) => `${x},${y}`)}`); }
-  if (ditherPatches.length) { issues++; out(`  [dither] ${ditherPatches.length} large regular 2x2 patch(es): ${sample(ditherPatches, (p) => `${p.x},${p.y} (${p.w}x${p.h}, ${p.n}px)`)}`); }
-  if (jumps.length) { issues++; out(`  [banding] ${jumps.length} intra-ramp step jump(s) > ${jumpLim}: ${sample(jumps, ([x, y, d]) => `${x},${y} (±${d})`)}`); }
-  if (outliers.length) { issues++; out(`  [ramp] ${outliers.length} stray speck(s) inside another ramp: ${sample(outliers, ([x, y, r, d]) => `${x},${y} ${r} in ${d}`)}`); }
-  if (unramped.length) { issues++; out(`  [unramped] ${unramped.length} pixel(s) not in any ramp (non-fullbright): ${sample(unramped, ([x, y]) => `${x},${y}`)}`); }
+  if (isolated.length) out(`  [noise] ${isolated.length} isolated pixel(s): ${sample(isolated, ([x, y]) => `${x},${y}`)}`);
+  if (ditherPatches.length) out(`  [dither] ${ditherPatches.length} large regular 2x2 patch(es): ${sample(ditherPatches, (p) => `${p.x},${p.y} (${p.w}x${p.h}, ${p.n}px)`)}`);
+  if (jumps.length) out(`  [banding] ${jumps.length} intra-ramp step jump(s) > ${jumpLim}: ${sample(jumps, ([x, y, d]) => `${x},${y} (±${d})`)}`);
+  if (outliers.length) out(`  [ramp] ${outliers.length} stray speck(s) inside another ramp: ${sample(outliers, ([x, y, r, d]) => `${x},${y} ${r} in ${d}`)}`);
+  if (unramped.length) out(`  [unramped] ${unramped.length} pixel(s) not in any ramp (non-fullbright): ${sample(unramped, ([x, y]) => `${x},${y}`)}`);
+  if (o.histogram) out(`  [histogram] zones(dark->bright): ${histogram.zones.map((p) => p + '%').join(' / ')}  range=${histogram.min}..${histogram.max} mean=${histogram.mean} std=${histogram.std}`);
+  if (lowReadability) out(`  [readability] detail washes out at 1/4 scale (full std ${stdL.toFixed(1)} -> 1/4 std ${downStd.toFixed(1)})`);
+  if (topRepeat) out(`  [repeat] periodic repetition detected at lag ${topRepeat.dx},${topRepeat.dy} (corr=${topRepeat.corr})`);
   if (!issues) out('  ok: no noise, banding, stray specks, or large regular dither patches found');
-  if (!o.mask && !o.region) seam();
+  if (seamStats) {
+    out(`seam x (col ${W - 1} | col 0): edge jump ${seamStats.x.edge.toFixed(1)}, interior avg ${seamStats.x.inner.toFixed(1)}, ratio ${seamStats.x.ratio.toFixed(2)} ${seamStats.x.ratio > 3 ? '<-- probably a visible seam: look with "zoom" across the edge' : 'ok'}`);
+    out(`seam y (row ${H - 1} | row 0): edge jump ${seamStats.y.edge.toFixed(1)}, interior avg ${seamStats.y.inner.toFixed(1)}, ratio ${seamStats.y.ratio.toFixed(2)} ${seamStats.y.ratio > 3 ? '<-- probably a visible seam: look with "zoom" across the edge' : 'ok'}`);
+  }
 }
-function seam() { // compares the color jump across each wrap edge with the average jump inside the tile
+function seam(silent = false) { // compares the color jump across each wrap edge with the average jump inside the tile
   needCanvas();
   const d = (a, b) => Math.sqrt(dist(S.pal[a], S.pal[b]));
   const rep = (label, n, len, at) => {
@@ -2992,10 +3356,12 @@ function seam() { // compares the color jump across each wrap edge with the aver
     for (let k = 0; k < len; k++) { edge += d(at(n - 1, k), at(0, k)); for (let p = 0; p + 1 < n; p++) inner += d(at(p, k), at(p + 1, k)); }
     edge /= len; inner /= len * Math.max(1, n - 1);
     const ratio = edge / Math.max(inner, 1);
-    out(`seam ${label}: edge jump ${edge.toFixed(1)}, interior avg ${inner.toFixed(1)}, ratio ${ratio.toFixed(2)} ${ratio > 3 ? '<-- probably a visible seam: look with "zoom" across the edge' : 'ok'}`);
+    if (!silent) out(`seam ${label}: edge jump ${edge.toFixed(1)}, interior avg ${inner.toFixed(1)}, ratio ${ratio.toFixed(2)} ${ratio > 3 ? '<-- probably a visible seam: look with "zoom" across the edge' : 'ok'}`);
+    return { edge: Number(edge.toFixed(2)), inner: Number(inner.toFixed(2)), ratio: Number(ratio.toFixed(2)) };
   };
-  rep(`x (col ${S.w - 1} | col 0)`, S.w, S.h, (p, k) => S.px[k * S.w + p]);
-  rep(`y (row ${S.h - 1} | row 0)`, S.h, S.w, (p, k) => S.px[p * S.w + k]);
+  const x = rep(`x (col ${S.w - 1} | col 0)`, S.w, S.h, (p, k) => S.px[k * S.w + p]);
+  const y = rep(`y (row ${S.h - 1} | row 0)`, S.h, S.w, (p, k) => S.px[p * S.w + k]);
+  return { x, y };
 }
 function listRamps() {
   if (!S.ramps.size) return out('ramps: (none) — define with: ramp <name> <idx|a..b ...>   or: ramp auto 16');
@@ -3403,15 +3769,43 @@ def('shape', '[name] new|clear|select|list|drop|copy|add|sub|and|xor|invert|mirr
   '2D CSG boolean mask builder (add/sub/and/xor ellipse|rect|poly|stroke|curve|spline|mask|shape), ASCII silhouette preview ("shape show"), fill/outline, or use shape=<name> in any command.', (a, o) => {
   needCanvas(); shapeCmd(a, o);
 }, false, ['all', 'closed', 'diag']);
-def('dump', '[view=char|idx|step|height] [region=x,y,w,h|anchor:name]', 'Print the whole canvas (or region=) as text (char = key letters + legend; height = relief map).', (a, o) => {
+def('dump', '[char|idx|step|height|luma|halfblock] [view=…] [scale=N] [region=x,y,w,h|anchor:name]', 'Print the whole canvas (or region=) as text or ANSI halfblock/luma minimap.', (a, o) => {
   needCanvas();
   const [rx, ry, rw, rh] = o.region ? regionOf(o) : [0, 0, Math.min(S.w, 512), Math.min(S.h, 512)];
-  show(rx, ry, Math.min(rw, 512), Math.min(rh, 512), o.view || 'char');
+  const sc = o.scale !== undefined ? num(o.scale, 1, 'scale') : 1;
+  show(rx, ry, Math.min(rw, 512), Math.min(rh, 512), o.view || a[0] || 'char', 1, sc);
 });
-def('zoom', '<x> <y> <w> <h> [view=char|idx|step|height]', 'Print a wrapped window of the canvas as text (x/y may be negative: look across the seam).', (a, o) => {
-  needCanvas(); show(coord(a[0], 'x', 'x'), coord(a[1], 'y', 'y'), coord(a[2], 'w', 'x'), coord(a[3], 'h', 'y'), o.view || 'char');
+def('zoom', '<x> <y> <w> <h> [view=char|idx|step|height|luma|halfblock] [scale=N]', 'Print a wrapped window of the canvas as text (x/y may be negative: look across the seam).', (a, o) => {
+  needCanvas();
+  const sc = o.scale !== undefined ? num(o.scale, 1, 'scale') : 1;
+  show(coord(a[0], 'x', 'x'), coord(a[1], 'y', 'y'), coord(a[2], 'w', 'x'), coord(a[3], 'h', 'y'), o.view || 'char', 1, sc);
 });
-def('lint', '[mask=…] [region=…] [jump=3]', 'Check for isolated noise pixels, large regular 2x2 dither patches, intra-ramp jumps > jump, stray ramp specks, and tile seams.', (a, o) => lintCanvas(o));
+def('bounds', '[bg=<color>] [shape=…] [mask=…] [region=…]', 'Report the tight bounding box of non-background (or scoped) pixels.', (a, o) => boundsCmd(o));
+def('probe', '<x> <y>', 'Inspect a single pixel: palette index, hex, RGB, luma, ramp:step, height, layer, shapes.', (a) => {
+  probeCmd(coord(a[0], 'x', 'x'), coord(a[1], 'y', 'y'));
+});
+def('state', 'save <file.ptxs> | load <file.ptxs>', 'Serialize or restore the full binary canvas/height/layers/palette/shapes state.', (a) => {
+  const sub = need(a[0], 'save|load'), f = need(a[1], 'file.ptxs');
+  if (sub === 'save') savePtxs(f);
+  else if (sub === 'load') loadPtxs(f);
+  else fail('state save <file.ptxs> | state load <file.ptxs>');
+});
+def('include', '<file.ptx>', 'Execute commands from another script file in the current state.', (a, o) => {
+  const f = need(a[0], 'file');
+  const baseDir = o._scriptDir || process.cwd();
+  const resolved = path.resolve(baseDir, f);
+  if (S.includeStack.includes(resolved)) fail(`circular include: ${resolved}`);
+  if (!fs.existsSync(resolved)) fail(`include not found: ${resolved}`);
+  S.includeStack.push(resolved);
+  try {
+    const res = runScript(fs.readFileSync(resolved, 'utf8'), resolved, true);
+    if (!res.ok) fail(`include failed in ${f}`);
+  } finally { S.includeStack.pop(); }
+});
+def('sheet', '<file.png> [scale=3] [pad=8]', 'Save an RGB PNG contact sheet (1x, Nx with rulers, 2x2 tile, height map).', (a, o) => {
+  sheetCmd(need(a[0], 'file.png'), o);
+});
+def('lint', '[mask=…] [region=…] [jump=3] [histogram] [json] [overlay=<file.png>]', 'Check noise, dither, banding, stray specks, seams, tonal histogram, readability, and repetition.', (a, o) => lintCanvas(o), false, ['histogram', 'json']);
 def('trace', 'on <dir> [scale=4] [pad=4] [all] | off', 'Save an upscaled PNG crop after each drawing command that changes pixels.', (a, o) => {
   const sub = need(a[0], 'on|off');
   if (sub === 'off') { S.trace.active = false; return out('trace off'); }
@@ -3439,7 +3833,7 @@ def('save', '<file.png> [scale=N] [tile=N]', 'Write an indexed 8-bit PNG (palett
 });
 
 // ─────────────────────────────────────────────────────────────── option parser, script runner, CLI
-const KNOWN = new Set('against all alpha amount angle angle_jitter ao ao_radius aspect axis bayer bevel bias bleed blend branch breakup bristles brush center chip clump cols color contrast count cross density depth dir dither elev face fill flow flow_jitter follow from gloss h height hi hi_mix hi_ramp hmode in jitter jump k keep len light light_mix light_ramp lip lo mask mid min mode mortar mortar_color n noise normal octaves opacity outline pad passes prob profile protect radial radius ramp ramps range region repeat reset ridge rim rim_elev rim_mix rim_ramp rim_strength rivets rot rough round rows scale scalex scaley scatter seed shade shade_jitter shadow shadow_mix shadow_ramp shape sharp side size size_jitter skip smooth soft spacing spec spread step strength style sym taper tex_scale thresh tile tilt tint to type vary view w warp width wobble'.split(' '));
+const KNOWN = new Set('against all alpha amount angle angle_jitter ao ao_radius aspect axis bayer bevel bg bias bleed blend branch breakup bristles brush center chip clump cols color contrast count cross density depth dir dither elev face fill flow flow_jitter follow from gloss h height hi hi_mix hi_ramp hmode in jitter jump k keep len light light_mix light_ramp lip lo mask mid min mode mortar mortar_color n noise normal octaves opacity outline overlay pad passes prob profile protect radial radius ramp ramps range region repeat reset ridge rim rim_elev rim_mix rim_ramp rim_strength rivets rot rough round rows scale scalex scaley scatter seed shade shade_jitter shadow shadow_mix shadow_ramp shape sharp side size size_jitter skip smooth soft spacing spec spread step strength style sym taper tex_scale thresh tile tilt tint to type vary view w warp width wobble'.split(' '));
 const parseRegion = (v) => {
   const s = String(v);
   if (s.startsWith('anchor:')) {
@@ -3466,7 +3860,8 @@ function parseArgs(toks, flags, warn, rawMode = false) {
   for (const t of toks) {
     const m = /^([^=]+)=(.*)$/s.exec(t);
     if (m) {
-      const [, k, v] = m;
+      const [, k] = m;
+      const v = m[2].replace(/^"(.*)"$/, '$1');
       if (flags.has(k) && /^(0|1|off|on|false|true|no|yes)$/i.test(v)) o[k] = !/^(0|off|false|no)$/i.test(v);
       else if (rawMode) o[k] = v;
       else {
@@ -3478,7 +3873,7 @@ function parseArgs(toks, flags, warn, rawMode = false) {
   }
   return { a, o };
 }
-const tokenize = (s) => (s.match(/"[^"]*"|\S+/g) || []).map((t) => t.replace(/^"(.*)"$/, '$1'));
+const tokenize = (s) => (s.match(/"[^"]*"|\S+="[^"]*"|\S+/g) || []).map((t) => t.replace(/^"(.*)"$/, '$1'));
 function stripInlineComment(s) {
   let inQ = false;
   for (let i = 0; i < s.length; i++) {
@@ -3507,8 +3902,9 @@ function helpCmd(name) {
 }
 def('help', '[command]', 'Overview, or the usage of one command.', (a) => helpCmd(a[0]));
 
-function runScript(text, label = 'script') {
+function runScript(text, label = 'script', nested = false) {
   const lines = text.split(/\r?\n/);
+  const scriptDir = (label !== 'script' && label !== 'stdin') ? path.dirname(path.resolve(label)) : process.cwd();
   let nCmd = 0, nWarn = 0;
   for (let n = 0; n < lines.length; n++) {
     const raw = lines[n], trimmed = raw.trim();
@@ -3573,6 +3969,7 @@ function runScript(text, label = 'script') {
       const toks = name === 'key' ? toks0 : tokenize(stripInlineComment(trimmed));
       const { a, o } = parseArgs(toks.slice(1), cmd.flags, warn);
       o._warn = warn;
+      o._scriptDir = scriptDir;
       const isShapeDraw = name === 'shape' && toks.slice(1).some((t) => t === 'fill' || t === 'paint' || t === 'outline');
       const shapeMut = name === 'shape' && a.length > 0 && a[0] !== 'list' && a[0] !== 'show' && a[1] !== 'show';
       const deferLight = name === 'light' && (a[0] === 'begin' || (a[0] !== 'end' && S.lightAccum?.active));
@@ -3603,15 +4000,19 @@ function runScript(text, label = 'script') {
     } catch (e) {
       out(`error ${label}:${n + 1}: ${trimmed.slice(0, 120)}\n  ${e.message}`);
       process.exitCode = 1;
-      return;
+      return { ok: false, nCmd, nWarn };
     }
   }
   if (S.brushStack.length) {
     out(`error ${label}: unclosed "with brush" block (missing "end")`);
     process.exitCode = 1;
-    return;
+    return { ok: false, nCmd, nWarn };
   }
-  out(`ok: ${nCmd} commands, ${nWarn} warning(s)${S.w ? `, canvas ${S.w}x${S.h}` : ''}`);
+  if (!nested) {
+    if (S.sheetOut && S.w) sheetCmd(S.sheetOut, {});
+    out(`ok: ${nCmd} commands, ${nWarn} warning(s)${S.w ? `, canvas ${S.w}x${S.h}` : ''}`);
+  }
+  return { ok: true, nCmd, nWarn };
 }
 (function main() {
   const args = process.argv.slice(2), pos = [];
@@ -3621,6 +4022,8 @@ function runScript(text, label = 'script') {
     else if (t === '--trace-scale') S.trace.scale = clamp(int(args[++i], 'trace-scale'), 1, 32);
     else if (t === '--trace-pad') S.trace.pad = clamp(int(args[++i], 'trace-pad'), 0, 64);
     else if (t === '--trace-all') S.trace.all = true;
+    else if (t === '--sheet') S.sheetOut = args[++i] || fail('--sheet requires <file.png>');
+    else if (t === '--json') S.json = true;
     else pos.push(t);
   }
   const [arg, ...rest] = pos;
