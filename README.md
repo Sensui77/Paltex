@@ -326,6 +326,14 @@ sym off
   - Executa `seam` automaticamente no canvas inteiro.
 - `save <arquivo.png> [scale=N] [tile=N]`: exporta PNG indexado 8-bit com paleta embutida.
 
+### Linguagem de Script (`let`, `{expr}`, `for`/`repeat`, `macro`, `stamp_along`, `--strict`)
+- `let <nome> = <expr>` (aceita múltiplos comandos separados por `;`, ex.: `let cx=63.5; let brow_y=54; let tooth_y=brow_y+27`).
+- **Expressões inline e `{expr}`**: coordenadas e parâmetros numéricos aceitam expressões aritméticas, trigonométricas (`sin`, `cos`, `atan2`, `sqrt`, `abs`, `min`, `max`, `floor`, `round`, `pi`) e propriedades de âncoras (`eye.y+eye.h/2`, `cx-14`), tanto diretamente quanto dentro de `{...}`.
+- **Loops**: `for <var> <ini>..<fim> [step=S]: <comando>` (1 linha) ou bloco `for ... end`, além de `repeat <N> [var]` (`... end` ou `: <comando>`).
+- **Macros**: `macro <nome> [arg1 arg2 ...]` ... `end` — chamadas diretamente por `<nome> <v1> <v2> ...`, com escopo local de parâmetros (números ou strings/cores).
+- **`stamp_along` / `scatter_along`**: `<sprite|sp1,sp2> curve|spline|line <p1 p2 ...> [count=N] [spacing=N] [rot=follow|random|DEG] [jitter=N] [seed=N]` — distribui sprites ao longo de curvas/linhas, alinhando à tangente local com `rot=follow` (e rotação em ângulo arbitrário no `stamp`).
+- **Modo estrito (`--strict` ou `strict on|off`)**: transforma qualquer `warning` (opção desconhecida, comando que alterou 0 pixels, `height` sem alterações) em erro fatal com código de saída `!= 0`.
+
 ---
 
 ## 9. Textura Procedural e Filtros 2D

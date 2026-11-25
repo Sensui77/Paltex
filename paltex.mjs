@@ -24,7 +24,8 @@ const S = {
   albedo: null, albedoLayer: -1, lightAccum: null, lastLights: [],
   undoStack: [], undoBytes: 0, checkpoints: new Map(), lastDiff: null,
   trace: { active: false, dir: null, scale: 4, pad: 4, all: false, step: 0 },
-  includeStack: [], sheetOut: null, json: false,
+  includeStack: [], sheetOut: null, json: false, strict: false,
+  vars: new Map(), strVars: new Map(), macros: new Map(),
 };
 const out = (s = '') => process.stdout.write(s + '\n');
 process.stdout.on('error', (e) => { if (e.code !== 'EPIPE') throw e; }); // "| head" must not kill the script (it may still have to save)
@@ -40,25 +41,154 @@ const unhex = (s) => {
   if (!/^[0-9a-f]{6}$/i.test(h)) fail(`bad hex color "${s}"`);
   return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16));
 };
+const MATH_FUNCS = {
+  sin: Math.sin, cos: Math.cos, tan: Math.tan, atan2: Math.atan2, sqrt: Math.sqrt,
+  abs: Math.abs, min: Math.min, max: Math.max, floor: Math.floor, ceil: Math.ceil,
+  round: Math.round, clamp, lerp: (a, b, t) => a + (b - a) * t,
+  deg2rad: (d) => (d * Math.PI) / 180, rad2deg: (r) => (r * 180) / Math.PI,
+};
+function resolveMathIdent(id, axis = 'x') {
+  if (S.vars.has(id)) return S.vars.get(id);
+  const dot = id.indexOf('.');
+  if (dot > 0) {
+    const nm = id.slice(0, dot), prop = id.slice(dot + 1);
+    let base = S.anchors.get(nm);
+    if (!base && S.w > 0 && (nm === 'cx' || nm === 'cy')) base = [Math.floor(S.w / 2), Math.floor(S.h / 2), null, null];
+    else if (!base && S.w > 0 && (nm === 'w' || nm === 'h')) base = [S.w, S.h, S.w, S.h];
+    if (!base) return null;
+    const idx = prop === 'x' ? 0 : prop === 'y' ? 1 : prop === 'w' ? 2 : prop === 'h' ? 3 : -1;
+    if (idx < 0 || base[idx] == null) return null;
+    return base[idx];
+  }
+  if (S.anchors.has(id)) {
+    const base = S.anchors.get(id);
+    return axis === 'y' ? base[1] : base[0];
+  }
+  if (id === 'pi') return Math.PI;
+  if (id === 'e') return Math.E;
+  if (S.w > 0) {
+    if (id === 'w') return S.w;
+    if (id === 'h') return S.h;
+    if (id === 'cx') return Math.floor(S.w / 2);
+    if (id === 'cy') return Math.floor(S.h / 2);
+  }
+  return null;
+}
+function evalMathExpr(expr, axis = 'x') {
+  const s = String(expr).trim();
+  if (!s) return null;
+  const toks = [];
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i];
+    if (/\s/.test(ch)) { i++; continue; }
+    if (s.slice(i, i + 2) === '**') { toks.push({ t: 'op', v: '**' }); i += 2; continue; }
+    if ('+-*/%^(),'.includes(ch)) { toks.push({ t: 'op', v: ch }); i++; continue; }
+    const nm = /^(?:\d+\.?\d*|\.\d+)/.exec(s.slice(i));
+    if (nm) { toks.push({ t: 'num', v: parseFloat(nm[0]) }); i += nm[0].length; continue; }
+    const idm = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[xywh])?/.exec(s.slice(i));
+    if (idm) { toks.push({ t: 'id', v: idm[0] }); i += idm[0].length; continue; }
+    return null;
+  }
+  if (!toks.length) return null;
+  let pos = 0;
+  const peek = () => toks[pos], eat = () => toks[pos++];
+  const parseExpr = () => parseAdd();
+  const parseAdd = () => {
+    let v = parseMul();
+    while (peek()?.t === 'op' && (peek().v === '+' || peek().v === '-')) {
+      const op = eat().v, r = parseMul();
+      v = op === '+' ? v + r : v - r;
+    }
+    return v;
+  };
+  const parseMul = () => {
+    let v = parsePow();
+    while (peek()?.t === 'op' && (peek().v === '*' || peek().v === '/' || peek().v === '%')) {
+      const op = eat().v, r = parsePow();
+      if ((op === '/' || op === '%') && r === 0) throw new Error(`division by zero in "${expr}"`);
+      v = op === '*' ? v * r : op === '/' ? v / r : v % r;
+    }
+    return v;
+  };
+  const parsePow = () => {
+    let v = parseUnary();
+    if (peek()?.t === 'op' && (peek().v === '**' || peek().v === '^')) { eat(); v = Math.pow(v, parsePow()); }
+    return v;
+  };
+  const parseUnary = () => {
+    if (peek()?.t === 'op' && (peek().v === '+' || peek().v === '-')) {
+      const op = eat().v, v = parseUnary();
+      return op === '-' ? -v : v;
+    }
+    return parsePrimary();
+  };
+  const parsePrimary = () => {
+    const tk = peek();
+    if (!tk) throw new Error('unexpected end');
+    if (tk.t === 'num') { eat(); return tk.v; }
+    if (tk.t === 'op' && tk.v === '(') {
+      eat();
+      const v = parseExpr();
+      if (peek()?.t !== 'op' || peek().v !== ')') throw new Error('missing )');
+      eat();
+      return v;
+    }
+    if (tk.t === 'id') {
+      eat();
+      if (peek()?.t === 'op' && peek().v === '(') {
+        const fn = MATH_FUNCS[tk.v];
+        if (!fn) throw new Error(`unknown function ${tk.v}`);
+        eat();
+        const args = [];
+        if (!(peek()?.t === 'op' && peek().v === ')')) {
+          args.push(parseExpr());
+          while (peek()?.t === 'op' && peek().v === ',') { eat(); args.push(parseExpr()); }
+        }
+        if (peek()?.t !== 'op' || peek().v !== ')') throw new Error('missing )');
+        eat();
+        return fn(...args);
+      }
+      const val = resolveMathIdent(tk.v, axis);
+      if (val === null) throw new Error(`unknown identifier ${tk.v}`);
+      return val;
+    }
+    throw new Error(`unexpected token ${tk.v}`);
+  };
+  try {
+    const res = parseExpr();
+    return (pos === toks.length && Number.isFinite(res)) ? res : null;
+  } catch {
+    return null;
+  }
+}
 const int = (t, what) => {
-  if (t === undefined || !/^[-+]?\d+$/.test(String(t))) fail(`expected integer for <${what}>, got "${t ?? 'nothing'}"`);
-  return parseInt(t, 10);
+  if (t !== undefined && /^[-+]?\d+$/.test(String(t))) return parseInt(t, 10);
+  if (t !== undefined) {
+    const mv = evalMathExpr(t);
+    if (mv !== null) return Math.round(mv);
+  }
+  fail(`expected integer for <${what}>, got "${t ?? 'nothing'}"`);
 };
 function evalAnchorExpr(t, axis = 'x', allowFloat = false) {
   const m = /^([A-Za-z_][A-Za-z0-9_]*)(?:\.([xywh]))?(?:([+-](?:\d+\.?\d*|\.\d+)))?$/.exec(String(t));
-  if (!m) return null;
-  const [, nm, prop, off] = m;
-  let base = null;
-  if (S.anchors.has(nm)) base = S.anchors.get(nm);
-  else if (S.w > 0 && (nm === 'cx' || nm === 'cy')) base = [Math.floor(S.w / 2), Math.floor(S.h / 2), null, null];
-  else if (S.w > 0 && (nm === 'w' || nm === 'h')) base = [S.w, S.h, S.w, S.h];
-  if (!base) return null;
-  if ((prop === 'w' || prop === 'h') && base[prop === 'w' ? 2 : 3] == null) return null;
-  const v = prop === 'x' ? base[0] : prop === 'y' ? base[1] : prop === 'w' ? base[2] : prop === 'h' ? base[3]
-    : (nm === 'cy' || nm === 'h') ? base[1] : (nm === 'cx' || nm === 'w') ? base[0]
-    : (axis === 'y' ? base[1] : base[0]);
-  const d = off ? (allowFloat ? parseFloat(off) : (/^[+-]\d+$/.test(off) ? parseInt(off, 10) : NaN)) : 0;
-  return Number.isNaN(d) ? null : v + d;
+  if (m) {
+    const [, nm, prop, off] = m;
+    let base = null;
+    if (S.anchors.has(nm)) base = S.anchors.get(nm);
+    else if (S.w > 0 && (nm === 'cx' || nm === 'cy')) base = [Math.floor(S.w / 2), Math.floor(S.h / 2), null, null];
+    else if (S.w > 0 && (nm === 'w' || nm === 'h')) base = [S.w, S.h, S.w, S.h];
+    if (base && !((prop === 'w' || prop === 'h') && base[prop === 'w' ? 2 : 3] == null)) {
+      const v = prop === 'x' ? base[0] : prop === 'y' ? base[1] : prop === 'w' ? base[2] : prop === 'h' ? base[3]
+        : (nm === 'cy' || nm === 'h') ? base[1] : (nm === 'cx' || nm === 'w') ? base[0]
+        : (axis === 'y' ? base[1] : base[0]);
+      const d = off ? (allowFloat ? parseFloat(off) : (/^[+-]\d+$/.test(off) ? parseInt(off, 10) : NaN)) : 0;
+      if (!Number.isNaN(d)) return v + d;
+    }
+  }
+  const mv = evalMathExpr(t, axis);
+  if (mv !== null) return allowFloat ? mv : Math.round(mv);
+  return null;
 }
 function coord(t, what, axis = 'x') {
   if (t === undefined) fail(`expected coordinate for <${what}>, got "nothing"`);
@@ -75,8 +205,12 @@ function coordf(t, what, axis = 'x') {
   fail(`expected number or anchor for <${what}>, got "${t}"`);
 }
 const float = (t, what) => {
-  if (t === undefined || !/^[-+]?(?:\d+\.?\d*|\.\d+)$/.test(String(t))) fail(`expected number for <${what}>, got "${t ?? 'nothing'}"`);
-  return parseFloat(t);
+  if (t !== undefined && /^[-+]?(?:\d+\.?\d*|\.\d+)$/.test(String(t))) return parseFloat(t);
+  if (t !== undefined) {
+    const mv = evalMathExpr(t);
+    if (mv !== null) return mv;
+  }
+  fail(`expected number for <${what}>, got "${t ?? 'nothing'}"`);
 };
 const num = (v, dflt, what = 'option') => (v === undefined ? dflt : int(v, what));
 const fnum = (v, dflt, what = 'option') => (v === undefined ? dflt : float(v, what));
@@ -765,19 +899,48 @@ function stampSize(W, H, o) {
   if (o.h !== undefined) oh = Math.max(1, coord(o.h, 'h', 'y'));
   return [clamp(ow, 1, 4096), clamp(oh, 1, 4096)];
 }
+function rotateSprite(sp, deg, fx = false, fy = false) {
+  const rad = (deg * Math.PI) / 180, cs = Math.cos(rad), sn = Math.sin(rad);
+  const { w, h, d, steps } = sp;
+  const rw = Math.max(1, Math.ceil(Math.abs(w * cs) + Math.abs(h * sn)));
+  const rh = Math.max(1, Math.ceil(Math.abs(w * sn) + Math.abs(h * cs)));
+  const outD = new Int16Array(rw * rh).fill(-1), outS = steps ? new Int16Array(rw * rh).fill(-1) : null;
+  const cx0 = w / 2, cy0 = h / 2, rcx = rw / 2, rcy = rh / 2;
+  for (let y = 0; y < rh; y++) for (let x = 0; x < rw; x++) {
+    const counts = new Map();
+    let bestC = -1, bestN = 0, bestS = -1;
+    for (let sy = -1; sy <= 1; sy++) for (let sx = -1; sx <= 1; sx++) {
+      const px = x + 0.5 + sx * 0.33 - rcx, py = y + 0.5 + sy * 0.33 - rcy;
+      let u = Math.floor(px * cs + py * sn + cx0), v = Math.floor(-px * sn + py * cs + cy0);
+      if (u < 0 || v < 0 || u >= w || v >= h) continue;
+      if (fx) u = w - 1 - u;
+      if (fy) v = h - 1 - v;
+      const c = d[v * w + u];
+      if (c < 0) continue;
+      const n = (counts.get(c) || 0) + 1;
+      counts.set(c, n);
+      if (n > bestN) { bestN = n; bestC = c; if (outS) bestS = steps[v * w + u]; }
+    }
+    if (bestC >= 0 && bestN >= 3) { outD[y * rw + x] = bestC; if (outS) outS[y * rw + x] = bestS; }
+  }
+  return { w: rw, h: rh, d: outD, steps: outS, rows: null, meta: sp.meta };
+}
 function stamp(sp, x, y, o) {
-  const { w, h } = sp, rot = mod(Math.round(num(o.rot, 0, 'rot') / 90), 4), [W, H] = rot & 1 ? [h, w] : [w, h];
+  const deg = fnum(o.rot, 0, 'rot');
+  const isOrtho = Math.abs(deg - Math.round(deg / 90) * 90) < 1e-3;
+  const effSp = isOrtho ? sp : rotateSprite(sp, deg, o.flipx, o.flipy);
+  const { w, h } = effSp, rot = isOrtho ? mod(Math.round(deg / 90), 4) : 0, [W, H] = rot & 1 ? [h, w] : [w, h];
   const [outW, outH] = stampSize(W, H, o);
   const ox = o._center ? x - Math.floor(outW / 2) : x, oy = o._center ? y - Math.floor(outH / 2) : y;
   const [nx, ny] = pair(o.repeat, [1, 1], 'repeat'), [sx, sy] = pair(o.step, [outW, outH], 'step'), sc = o._sc || scope(o);
   const relMode = !!o._relShade, sh = o._shade || 0, seen = relMode ? new Set() : null;
-  const rLen = sp.meta?.ramp && S.ramps.get(sp.meta.ramp) ? S.ramps.get(sp.meta.ramp).length : 16;
-  const mid = num(o.mid, sp.meta?.mid ?? (rLen >> 1), 'mid');
+  const rLen = effSp.meta?.ramp && S.ramps.get(effSp.meta.ramp) ? S.ramps.get(effSp.meta.ramp).length : 16;
+  const mid = num(o.mid, effSp.meta?.mid ?? (rLen >> 1), 'mid');
   const [jx, jy] = o._nosym ? [0, 0] : symJitter(3);
   for (let ry = 0; ry < ny; ry++) for (let rx = 0; rx < nx; rx++) for (let j = 0; j < outH; j++) for (let i = 0; i < outW; i++) {
     const si = outW === W ? i : Math.min(W - 1, Math.floor(((i + 0.5) * W) / outW));
     const sj = outH === H ? j : Math.min(H - 1, Math.floor(((j + 0.5) * H) / outH));
-    const { c, step } = sprAt(sp, rot, o.flipx, o.flipy, si, sj);
+    const { c, step } = isOrtho ? sprAt(effSp, rot, o.flipx, o.flipy, si, sj) : { c: effSp.d[sj * W + si], step: effSp.steps ? effSp.steps[sj * W + si] : -1 };
     if (c < 0) continue;
     const X = ox + rx * sx + i, Y = oy + ry * sy + j;
     for (const [px, py] of o._nosym ? [[X, Y]] : symPoints(X, Y, jx, jy)) {
@@ -795,6 +958,58 @@ function stamp(sp, x, y, o) {
         put(px, py, sh ? shadeIdx(c, sh) : c);
       }
     }
+  }
+}
+function stampAlongCmd(a, o, isScatter = false) {
+  const spList = need(a[0], 'sprite').split(',').map((nm) => S.sprites.get(nm) || fail(`unknown sprite "${nm}"`));
+  const mode = need(a[1], 'curve|spline|line');
+  if (!['curve', 'spline', 'line'].includes(mode)) fail('stamp_along/scatter_along mode must be curve | spline | line');
+  const rawPts = a.slice(2).map((t) => {
+    const p = t.split(',');
+    return p.length === 2 ? [coordf(p[0], 'x', 'x'), coordf(p[1], 'y', 'y')] : [coordf(t, 'x', 'x'), coordf(t, 'y', 'y')];
+  });
+  if (rawPts.length < 2) fail('need at least 2 points');
+  const path = mode === 'line' ? rawPts : evalCurve(rawPts, !!o.closed, mode === 'spline');
+  const cum = [0];
+  for (let i = 1; i < path.length; i++) {
+    cum.push(cum[i - 1] + Math.hypot(path[i][0] - path[i - 1][0], path[i][1] - path[i - 1][1]));
+  }
+  const totalL = cum[cum.length - 1];
+  if (totalL <= 0) fail('path has zero length');
+  const maxDim = Math.max(...spList.map((s) => Math.max(s.w, s.h)));
+  const sVals = [];
+  if (o.count !== undefined) {
+    const N = clamp(int(o.count, 'count'), 1, 1024);
+    if (N === 1) sVals.push(totalL * 0.5);
+    else for (let i = 0; i < N; i++) sVals.push((i * totalL) / (o.closed ? N : N - 1));
+  } else {
+    const spacing = Math.max(0.5, fnum(o.spacing, maxDim, 'spacing'));
+    for (let s = 0; s <= totalL + 1e-6; s += spacing) sVals.push(Math.min(s, totalL));
+  }
+  const seed = num(o.seed, 0, 'seed'), rand = rng(seed), jit = fnum(o.jitter, 0, 'jitter');
+  const rotSpec = o.rot || '0';
+  const sc = scope(o);
+  const stampOpts = { ...o, _center: true, _sc: sc };
+  if (o.shade === 'rel') { stampOpts._relShade = true; stampOpts._shade = 0; }
+  else if (o.shade !== undefined) { stampOpts._shade = int(o.shade, 'shade'); }
+  for (let k = 0; k < sVals.length; k++) {
+    const s = sVals[k];
+    let idx = 0;
+    while (idx + 1 < cum.length - 1 && cum[idx + 1] < s) idx++;
+    const segL = cum[idx + 1] - cum[idx] || 1, u = clamp((s - cum[idx]) / segL, 0, 1);
+    const x0 = path[idx][0], y0 = path[idx][1], x1 = path[idx + 1][0], y1 = path[idx + 1][1];
+    let px = x0 + (x1 - x0) * u, py = y0 + (y1 - y0) * u;
+    const tx = x1 - x0, ty = y1 - y0, tl = Math.hypot(tx, ty) || 1;
+    if (jit > 0) {
+      const off = (rand() * 2 - 1) * jit;
+      px += (-ty / tl) * off; py += (tx / tl) * off;
+    }
+    const sp = isScatter ? spList[Math.floor(rand() * spList.length)] : spList[0];
+    let deg = 0;
+    if (rotSpec === 'follow') deg = (Math.atan2(ty, tx) * 180) / Math.PI;
+    else if (rotSpec === 'random') deg = Math.floor(rand() * 4) * 90;
+    else deg = fnum(rotSpec, 0, 'rot');
+    stamp(sp, Math.round(px), Math.round(py), { ...stampOpts, rot: String(deg) });
   }
 }
 
@@ -3769,6 +3984,20 @@ def('shape', '[name] new|clear|select|list|drop|copy|add|sub|and|xor|invert|mirr
   '2D CSG boolean mask builder (add/sub/and/xor ellipse|rect|poly|stroke|curve|spline|mask|shape), ASCII silhouette preview ("shape show"), fill/outline, or use shape=<name> in any command.', (a, o) => {
   needCanvas(); shapeCmd(a, o);
 }, false, ['all', 'closed', 'diag']);
+def('stamp_along', '<sprite> <curve|spline|line> <p1 p2 ...> [count=N] [spacing=N] [rot=follow|DEG] [jitter=N] [seed=N] [scale=...] [shade=...] [closed]',
+  'Stamp a sprite repeatedly along a line, curve, or spline; rot=follow aligns each stamp to the local tangent.', (a, o) => {
+  needCanvas(); stampAlongCmd(a, o, false);
+}, true, ['closed', 'flipx', 'flipy', 'center']);
+def('scatter_along', '<sp1,sp2,...> <curve|spline|line> <p1 p2 ...> [count=N] [spacing=N] [rot=follow|random|DEG] [jitter=N] [seed=N] [scale=...] [shade=...] [closed]',
+  'Scatter sprites randomly from a list along a line, curve, or spline.', (a, o) => {
+  needCanvas(); stampAlongCmd(a, o, true);
+}, true, ['closed', 'flipx', 'flipy', 'center']);
+def('strict', 'on | off', 'Treat any warning (unknown option, 0 pixels changed, 0 height samples) as a fatal error.', (a) => {
+  const v = need(a[0], 'on|off');
+  if (v !== 'on' && v !== 'off') fail('strict on | strict off');
+  S.strict = v === 'on';
+  out(`strict ${S.strict ? 'on' : 'off'}`);
+});
 def('dump', '[char|idx|step|height|luma|halfblock] [view=…] [scale=N] [region=x,y,w,h|anchor:name]', 'Print the whole canvas (or region=) as text or ANSI halfblock/luma minimap.', (a, o) => {
   needCanvas();
   const [rx, ry, rw, rh] = o.region ? regionOf(o) : [0, 0, Math.min(S.w, 512), Math.min(S.h, 512)];
@@ -3902,6 +4131,60 @@ function helpCmd(name) {
 }
 def('help', '[command]', 'Overview, or the usage of one command.', (a) => helpCmd(a[0]));
 
+function expandBraces(s) {
+  if (!s.includes('{')) return s;
+  return s.replace(/\{([^}]+)\}/g, (_, inner) => {
+    const key = inner.trim();
+    if (S.strVars.has(key)) return S.strVars.get(key);
+    const v = evalMathExpr(key);
+    if (v === null) fail(`bad expression "{${inner}}"`);
+    return Number.isInteger(v) ? String(v) : String(Number(v.toFixed(6)));
+  });
+}
+function splitStatements(line) {
+  const outStmts = [], isKeyCmd = /^key\s/.test(line.trimStart());
+  let cur = '', inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') { inQ = !inQ; cur += ch; continue; }
+    if (!inQ && !isKeyCmd && ch === '#' && i > 0 && /\s/.test(line[i - 1]) && !/^#([0-9a-f]{3}|[0-9a-f]{6})(\s|$)|^#=/i.test(line.slice(i))) break;
+    if (!inQ && ch === ';') {
+      if (cur.trim()) outStmts.push(cur.trim());
+      cur = '';
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur.trim()) outStmts.push(cur.trim());
+  return outStmts;
+}
+function collectBlock(lines, startIdx, kind) {
+  const body = [];
+  let depth = 1, k = startIdx + 1;
+  for (; k < lines.length; k++) {
+    const t = lines[k].trim();
+    if (!t || t[0] === '#') { body.push(lines[k]); continue; }
+    const first = t.split(/\s+/)[0];
+    if (first === 'sprite' || first === 'with' || first === 'macro') depth++;
+    else if ((first === 'for' || first === 'repeat') && !/:/.test(stripInlineComment(t))) depth++;
+    else if (first === 'end') {
+      depth--;
+      if (depth === 0) return { body, endIdx: k };
+    }
+    body.push(lines[k]);
+  }
+  fail(`unclosed "${kind}" block (missing "end")`);
+}
+function evalLetStmt(rest) {
+  const eq = rest.indexOf('=');
+  if (eq <= 0) fail(`let syntax: let <name> = <expr>`);
+  const nm = rest.slice(0, eq).trim(), expr = rest.slice(eq + 1).trim();
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(nm)) fail(`bad variable name "${nm}"`);
+  const val = evalMathExpr(expandBraces(expr));
+  if (val === null) fail(`invalid expression in let ${nm} = ${expr}`);
+  S.vars.set(nm, val);
+  S.strVars.delete(nm);
+}
 function runScript(text, label = 'script', nested = false) {
   const lines = text.split(/\r?\n/);
   const scriptDir = (label !== 'script' && label !== 'stdin') ? path.dirname(path.resolve(label)) : process.cwd();
@@ -3909,30 +4192,14 @@ function runScript(text, label = 'script', nested = false) {
   for (let n = 0; n < lines.length; n++) {
     const raw = lines[n], trimmed = raw.trim();
     if (!trimmed || trimmed[0] === '#') continue;
-    const toks0 = tokenize(trimmed), name = toks0[0];
-    const warn = (m) => { nWarn++; out(`warning ${label}:${n + 1}: ${m}`); };
+    const warn = (m) => {
+      if (S.strict) fail(m);
+      nWarn++; out(`warning ${label}:${n + 1}: ${m}`);
+    };
     try {
-      const cmd = C[name] || fail(`unknown command "${name}" — run "help" for the list`);
-      if (name === 'with') {
-        const clean = stripInlineComment(trimmed), toks = tokenize(clean);
-        if (toks[1] !== 'brush') fail('only "with brush [opts]" is supported');
-        S.brushStack.push({ brush: { ...S.brush, taper: [...S.brush.taper], shade: [...S.brush.shade] }, brushOn: S.brushOn });
-        const { a, o } = parseArgs(toks.slice(2), C.brush.flags, warn);
-        if (a.length || Object.keys(o).length) {
-          needPal();
-          applyBrushOpts(S.brush, a[0] || null, a[1] || null, o);
-          S.brushOn = true;
-        }
-        nCmd++; continue;
-      }
-      if (name === 'end') {
-        if (!S.brushStack.length) fail('"end" without matching "sprite" or "with brush"');
-        const prev = S.brushStack.pop();
-        S.brush = prev.brush; S.brushOn = prev.brushOn;
-        nCmd++; continue;
-      }
-      if (name === 'sprite') {
-        const clean = stripInlineComment(trimmed), toks = tokenize(clean);
+      const head = trimmed.split(/\s+/)[0];
+      if (head === 'sprite') {
+        const clean = stripInlineComment(trimmed), toks = tokenize(expandBraces(clean));
         if (toks[1] === 'show') {
           const { a, o } = parseArgs(toks.slice(2), new Set(), warn);
           showSprite(need(a[0], 'sprite'), o.view || 'char');
@@ -3965,45 +4232,178 @@ function runScript(text, label = 'script', nested = false) {
         n = k; nCmd++;
         continue;
       }
-      // inline comments: " # …" (never for "key", where "#" is a legal key char)
-      const toks = name === 'key' ? toks0 : tokenize(stripInlineComment(trimmed));
-      const { a, o } = parseArgs(toks.slice(1), cmd.flags, warn);
-      o._warn = warn;
-      o._scriptDir = scriptDir;
-      const isShapeDraw = name === 'shape' && toks.slice(1).some((t) => t === 'fill' || t === 'paint' || t === 'outline');
-      const shapeMut = name === 'shape' && a.length > 0 && a[0] !== 'list' && a[0] !== 'show' && a[1] !== 'show';
-      const deferLight = name === 'light' && (a[0] === 'begin' || (a[0] !== 'end' && S.lightAccum?.active));
-      const isDraw = (cmd.draw && !deferLight) || isShapeDraw || name === 'relight' || (name === 'albedo' && a[0] === 'restore');
-      const mutates = isDraw || shapeMut || ['height', 'resize', 'shift', 'flip', 'albedo'].includes(name) || (name === 'layer' && a[0] && a[0] !== 'list');
-      const skipUndo = name === 'undo' || name === 'restore';
-      if (mutates && !skipUndo && S.w) pushUndo(toks.join(' ').slice(0, 50));
-      const beforePx = (isDraw || (name === 'layer' && a[0] && a[0] !== 'list')) && S.w ? S.px.slice() : null;
-      const before = S.changed, hBefore = S.hchanged;
-      S.cmdSeq++;
-      const prevSym = (name !== 'sym' && o.sym !== undefined) ? { ...S.sym } : null;
-      if (prevSym) {
-        if (!['off', 'x', 'y', 'xy'].includes(o.sym)) fail('sym= must be off | x | y | xy');
-        S.sym.mode = o.sym;
-        if (o.axis !== undefined && name !== 'shape') {
-          const [ax, ay] = parseAxisOpt(o.axis, S.sym.ax, S.sym.ay);
-          S.sym.ax = ax; S.sym.ay = ay;
+      if (head === 'macro') {
+        const toks = tokenize(stripInlineComment(trimmed));
+        const mname = need(toks[1], 'macro name');
+        if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(mname)) fail(`bad macro name "${mname}"`);
+        const params = toks.slice(2);
+        const { body, endIdx } = collectBlock(lines, n, `macro ${mname}`);
+        S.macros.set(mname, { params, body: body.join('\n') });
+        n = endIdx; nCmd++;
+        continue;
+      }
+      if ((head === 'for' || head === 'repeat') && !/:/.test(stripInlineComment(trimmed))) {
+        const clean = expandBraces(stripInlineComment(trimmed)), toks = tokenize(clean);
+        const { body, endIdx } = collectBlock(lines, n, head);
+        const bodyText = body.join('\n');
+        n = endIdx;
+        if (head === 'for') {
+          const varName = need(toks[1], 'var'), rangeTok = need(toks[2], 'start..end');
+          const { o } = parseArgs(toks.slice(3), new Set(), warn);
+          const m = /^(.+?)\.\.(.+)$/.exec(rangeTok) || fail(`for range must be start..end, got "${rangeTok}"`);
+          const start = int(m[1], 'start'), endV = int(m[2], 'end');
+          const step = o.step !== undefined ? int(o.step, 'step') : (start <= endV ? 1 : -1);
+          if (step === 0) fail('for step cannot be 0');
+          const hadVar = S.vars.has(varName), prevVar = S.vars.get(varName);
+          try {
+            for (let v = start; step > 0 ? v <= endV : v >= endV; v += step) {
+              S.vars.set(varName, v);
+              const res = runScript(bodyText, label, true);
+              if (!res.ok) return { ok: false, nCmd, nWarn };
+              nCmd += res.nCmd; nWarn += res.nWarn;
+            }
+          } finally { if (hadVar) S.vars.set(varName, prevVar); else S.vars.delete(varName); }
+        } else {
+          const cnt = int(need(toks[1], 'count'), 'count'), varName = toks[2] || '_i';
+          const hadVar = S.vars.has(varName), prevVar = S.vars.get(varName);
+          try {
+            for (let v = 0; v < cnt; v++) {
+              S.vars.set(varName, v);
+              const res = runScript(bodyText, label, true);
+              if (!res.ok) return { ok: false, nCmd, nWarn };
+              nCmd += res.nCmd; nWarn += res.nWarn;
+            }
+          } finally { if (hadVar) S.vars.set(varName, prevVar); else S.vars.delete(varName); }
         }
+        continue;
       }
-      try { cmd.fn(a, o); } finally { if (prevSym) S.sym = prevSym; }
-      nCmd++;
-      if (beforePx) {
-        S.lastDiff = { px: beforePx, cmd: toks.join(' ').slice(0, 60) };
-        saveTrace(beforePx, name);
+      if (head === 'for' || head === 'repeat') {
+        const clean = stripInlineComment(trimmed);
+        const colIdx = clean.indexOf(':');
+        const hdr = expandBraces(clean.slice(0, colIdx).trim()), bodyText = clean.slice(colIdx + 1).trim();
+        const toks = tokenize(hdr);
+        if (head === 'for') {
+          const varName = need(toks[1], 'var'), rangeTok = need(toks[2], 'start..end');
+          const { o } = parseArgs(toks.slice(3), new Set(), warn);
+          const m = /^(.+?)\.\.(.+)$/.exec(rangeTok) || fail(`for range must be start..end, got "${rangeTok}"`);
+          const start = int(m[1], 'start'), endV = int(m[2], 'end');
+          const step = o.step !== undefined ? int(o.step, 'step') : (start <= endV ? 1 : -1);
+          if (step === 0) fail('for step cannot be 0');
+          const hadVar = S.vars.has(varName), prevVar = S.vars.get(varName);
+          try {
+            for (let v = start; step > 0 ? v <= endV : v >= endV; v += step) {
+              S.vars.set(varName, v);
+              const res = runScript(bodyText, label, true);
+              if (!res.ok) return { ok: false, nCmd, nWarn };
+              nCmd += res.nCmd; nWarn += res.nWarn;
+            }
+          } finally { if (hadVar) S.vars.set(varName, prevVar); else S.vars.delete(varName); }
+        } else {
+          const cnt = int(need(toks[1], 'count'), 'count'), varName = toks[2] || '_i';
+          const hadVar = S.vars.has(varName), prevVar = S.vars.get(varName);
+          try {
+            for (let v = 0; v < cnt; v++) {
+              S.vars.set(varName, v);
+              const res = runScript(bodyText, label, true);
+              if (!res.ok) return { ok: false, nCmd, nWarn };
+              nCmd += res.nCmd; nWarn += res.nWarn;
+            }
+          } finally { if (hadVar) S.vars.set(varName, prevVar); else S.vars.delete(varName); }
+        }
+        continue;
       }
-      if (isDraw && S.changed === before) warn(`"${toks.join(' ').slice(0, 70)}" changed 0 pixels (mask/region matched nothing, or colours already equal)`);
-      if (name === 'height' && a[0] !== 'clear' && S.hchanged === hBefore) warn(`"${toks.join(' ').slice(0, 70)}" changed 0 height samples`);
+
+      const stmts = splitStatements(trimmed);
+      for (const stmt of stmts) {
+        const rawToks = tokenize(stmt);
+        const name = rawToks[0];
+        if (name === 'let') {
+          evalLetStmt(stmt.slice(3).trim());
+          nCmd++; continue;
+        }
+        const expanded = name === 'key' ? stmt : expandBraces(stmt);
+        const toks0 = tokenize(expanded);
+        if (name === 'with') {
+          if (toks0[1] !== 'brush') fail('only "with brush [opts]" is supported');
+          S.brushStack.push({ brush: { ...S.brush, taper: [...S.brush.taper], shade: [...S.brush.shade] }, brushOn: S.brushOn });
+          const { a, o } = parseArgs(toks0.slice(2), C.brush.flags, warn);
+          if (a.length || Object.keys(o).length) {
+            needPal();
+            applyBrushOpts(S.brush, a[0] || null, a[1] || null, o);
+            S.brushOn = true;
+          }
+          nCmd++; continue;
+        }
+        if (name === 'end') {
+          if (!S.brushStack.length) fail('"end" without matching "sprite", "macro", "for", "repeat", or "with brush"');
+          const prev = S.brushStack.pop();
+          S.brush = prev.brush; S.brushOn = prev.brushOn;
+          nCmd++; continue;
+        }
+        if (!C[name] && S.macros.has(name)) {
+          const mac = S.macros.get(name), args = toks0.slice(1);
+          if (args.length < mac.params.length) fail(`macro "${name}" expects ${mac.params.length} arg(s): ${mac.params.join(' ')}`);
+          const savedNum = new Map(), savedStr = new Map();
+          for (let pi = 0; pi < mac.params.length; pi++) {
+            const p = mac.params[pi];
+            if (S.vars.has(p)) savedNum.set(p, S.vars.get(p));
+            if (S.strVars.has(p)) savedStr.set(p, S.strVars.get(p));
+            const mv = evalMathExpr(args[pi]);
+            if (mv !== null) { S.vars.set(p, mv); S.strVars.delete(p); }
+            else { S.strVars.set(p, args[pi]); S.vars.delete(p); }
+          }
+          try {
+            const res = runScript(mac.body, `${label}->${name}`, true);
+            if (!res.ok) return { ok: false, nCmd, nWarn };
+            nCmd += res.nCmd; nWarn += res.nWarn;
+          } finally {
+            for (const p of mac.params) {
+              if (savedNum.has(p)) S.vars.set(p, savedNum.get(p)); else S.vars.delete(p);
+              if (savedStr.has(p)) S.strVars.set(p, savedStr.get(p)); else S.strVars.delete(p);
+            }
+          }
+          nCmd++; continue;
+        }
+        const cmd = C[name] || fail(`unknown command "${name}" — run "help" for the list`);
+        const toks = name === 'key' ? toks0 : tokenize(stripInlineComment(expanded));
+        const { a, o } = parseArgs(toks.slice(1), cmd.flags, warn);
+        o._warn = warn;
+        o._scriptDir = scriptDir;
+        const isShapeDraw = name === 'shape' && toks.slice(1).some((t) => t === 'fill' || t === 'paint' || t === 'outline');
+        const shapeMut = name === 'shape' && a.length > 0 && a[0] !== 'list' && a[0] !== 'show' && a[1] !== 'show';
+        const deferLight = name === 'light' && (a[0] === 'begin' || (a[0] !== 'end' && S.lightAccum?.active));
+        const isDraw = (cmd.draw && !deferLight) || isShapeDraw || name === 'relight' || (name === 'albedo' && a[0] === 'restore');
+        const mutates = isDraw || shapeMut || ['height', 'resize', 'shift', 'flip', 'albedo'].includes(name) || (name === 'layer' && a[0] && a[0] !== 'list');
+        const skipUndo = name === 'undo' || name === 'restore';
+        if (mutates && !skipUndo && S.w) pushUndo(toks.join(' ').slice(0, 50));
+        const beforePx = (isDraw || (name === 'layer' && a[0] && a[0] !== 'list')) && S.w ? S.px.slice() : null;
+        const before = S.changed, hBefore = S.hchanged;
+        S.cmdSeq++;
+        const prevSym = (name !== 'sym' && o.sym !== undefined) ? { ...S.sym } : null;
+        if (prevSym) {
+          if (!['off', 'x', 'y', 'xy'].includes(o.sym)) fail('sym= must be off | x | y | xy');
+          S.sym.mode = o.sym;
+          if (o.axis !== undefined && name !== 'shape') {
+            const [ax, ay] = parseAxisOpt(o.axis, S.sym.ax, S.sym.ay);
+            S.sym.ax = ax; S.sym.ay = ay;
+          }
+        }
+        try { cmd.fn(a, o); } finally { if (prevSym) S.sym = prevSym; }
+        nCmd++;
+        if (beforePx) {
+          S.lastDiff = { px: beforePx, cmd: toks.join(' ').slice(0, 60) };
+          saveTrace(beforePx, name);
+        }
+        if (isDraw && S.changed === before) warn(`"${toks.join(' ').slice(0, 70)}" changed 0 pixels (mask/region matched nothing, or colours already equal)`);
+        if (name === 'height' && a[0] !== 'clear' && S.hchanged === hBefore) warn(`"${toks.join(' ').slice(0, 70)}" changed 0 height samples`);
+      }
     } catch (e) {
       out(`error ${label}:${n + 1}: ${trimmed.slice(0, 120)}\n  ${e.message}`);
       process.exitCode = 1;
       return { ok: false, nCmd, nWarn };
     }
   }
-  if (S.brushStack.length) {
+  if (!nested && S.brushStack.length) {
     out(`error ${label}: unclosed "with brush" block (missing "end")`);
     process.exitCode = 1;
     return { ok: false, nCmd, nWarn };
@@ -4024,6 +4424,7 @@ function runScript(text, label = 'script', nested = false) {
     else if (t === '--trace-all') S.trace.all = true;
     else if (t === '--sheet') S.sheetOut = args[++i] || fail('--sheet requires <file.png>');
     else if (t === '--json') S.json = true;
+    else if (t === '--strict') S.strict = true;
     else pos.push(t);
   }
   const [arg, ...rest] = pos;

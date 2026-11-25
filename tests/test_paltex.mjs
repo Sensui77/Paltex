@@ -843,6 +843,99 @@ console.log('15. Bloco 3: state, include, dump halfblock/luma, bounds, probe, sh
   assert.ok(fs.existsSync(cliSheetPng), '--sheet CLI flag created contact sheet PNG');
 }
 
+// ── 16. Bloco 4 (linguagem & curvas): let, expressões, for/repeat, macro, stamp_along/scatter_along, --strict
+console.log('16. Bloco 4 (linguagem): let, math exprs, for/repeat, macro, stamp_along/scatter_along, --strict');
+{
+  const langPng = path.join(SCRATCH, 'lang_test.png');
+  const alongPng = path.join(SCRATCH, 'along_test.png');
+
+  // A) let, ; chaining, {expr}, inline exprs, anchor.prop, for inline + block, repeat, macro
+  const langOut = runPTX(`
+    palette quake
+    new 64 64 slate:2
+    anchor eye 20 20 8 6
+    let cx = 32; let brow_y = 10; let tooth_y = brow_y+20
+    # Inline expr + anchor property expr
+    pixel cx-14 eye.y+eye.h/2 fb_lava:6
+    # Inline for loop with {expr}
+    for i 0..5: rect {10+i*6} {tooth_y} 4 6 bone:9 fill
+    # Block repeat loop
+    repeat 3 k
+      pixel {4+k*2} 50 fb_plasma:5
+    end
+    # Macro with numeric + string params; must not leak param names to outer scope
+    let x = 99
+    macro stud x y col
+      rect {x-1} {y-1} 3 3 {col} fill
+    end
+    stud 50 12 rust:12
+    stud 56 12 gold:12
+    # Verify outer x=99 survived macro call
+    pixel x-40 50 fb_runic:4
+    save "${langPng.replace(/\\/g, '/')}"
+  `);
+  assert.match(langOut, /ok: .* 0 warning\(s\)/);
+  const imLang = readPNGInfo(langPng);
+  // cx-14 = 18, eye.y+eye.h/2 = 23 -> fb_lava:6 (230)
+  assert.equal(imLang.px[23 * 64 + 18], 230, 'inline expr cx-14 and eye.y+eye.h/2 evaluated');
+  // 6 teeth at x=10,16,22,28,34,40, y=30
+  for (let i = 0; i < 6; i++) {
+    assert.notEqual(imLang.px[30 * 64 + (10 + i * 6)], 2 * 16 + 2, `for loop tooth ${i} painted`);
+  }
+  // repeat 3 k -> (4,50), (6,50), (8,50)
+  assert.equal(imLang.px[50 * 64 + 8], 245, 'repeat block loop painted third pixel');
+  // macro studs at (50,12) rust:12 and (56,12) gold:12
+  assert.equal(Math.floor(imLang.px[12 * 64 + 50] / 16), 5, 'macro drew rust stud');
+  assert.equal(Math.floor(imLang.px[12 * 64 + 56] / 16), 6, 'macro drew gold stud');
+  // outer x=99 -> 99-40 = 59
+  assert.equal(imLang.px[50 * 64 + 59], 252, 'macro parameter did not clobber outer variable x');
+
+  // B) stamp_along and scatter_along with rot=follow
+  const alongOut = runPTX(`
+    palette quake
+    new 64 64 slate:2
+    key # fb_lava:6
+    key * fb_fire:6
+    sprite bar
+      .....
+      #####
+      .....
+    end
+    sprite arrow
+      ..*..
+      .****
+      ..*..
+    end
+    stamp_along arrow curve 8,48 24,16 48,16 56,48 count=5 rot=follow
+    scatter_along arrow,bar line 8,58 56,58 count=4 rot=0 seed=7
+    save "${alongPng.replace(/\\/g, '/')}"
+  `);
+  assert.match(alongOut, /ok: .* 0 warning\(s\)/);
+  const imAlong = readPNGInfo(alongPng);
+  // Check pixels near curve start (8,48), middle (~32,16), end (56,48) have fb_fire
+  const hasFireNear = (cx, cy) => {
+    for (let dy = -3; dy <= 3; dy++) for (let dx = -3; dx <= 3; dx++) {
+      const c = imAlong.px[(cy + dy) * 64 + (cx + dx)];
+      if (c >= 232 && c <= 239) return true;
+    }
+    return false;
+  };
+  assert.ok(hasFireNear(8, 48), 'stamp_along stamped at curve start');
+  assert.ok(hasFireNear(32, 20) || hasFireNear(32, 16), 'stamp_along stamped near curve apex');
+  assert.ok(hasFireNear(56, 48), 'stamp_along stamped at curve end');
+
+  // C) --strict turns warnings into fatal exit code != 0
+  assert.throws(() => runPTX(`new 16 16 stone:4\nrect 0 0 16 16 stone:4 fill\n`, ['--strict']), (err) => {
+    assert.match(String(err.stdout || '') + String(err.stderr || '') + err.message, /changed 0 pixels/);
+    return true;
+  }, '--strict failed on 0-pixel-changed warning');
+  assert.throws(() => runPTX(`new 16 16 stone:4\nrect 0 0 4 4 stone:8 fill bogus=1\n`, ['--strict']), (err) => {
+    assert.match(String(err.stdout || '') + String(err.stderr || '') + err.message, /unknown option/);
+    return true;
+  }, '--strict failed on unknown option warning');
+}
+
+
 
 fs.rmSync(SCRATCH, { recursive: true, force: true });
 console.log('ALL TESTS PASSED!');
