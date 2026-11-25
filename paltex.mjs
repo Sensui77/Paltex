@@ -20,7 +20,7 @@ const S = {
   brush: DEFAULT_BRUSH(), brushOn: false, brushStack: [],
   sym: { mode: 'off', ax: null, ay: null, jitter: 0, seed: 0 },
   layers: [], activeLayer: -1, belowPx: null,
-  albedo: null, lightAccum: null, lastLights: [],
+  albedo: null, albedoLayer: -1, lightAccum: null, lastLights: [],
   undoStack: [], undoBytes: 0, checkpoints: new Map(), lastDiff: null,
   trace: { active: false, dir: null, scale: 4, pad: 4, all: false, step: 0 },
 };
@@ -170,8 +170,8 @@ function applyQuakeRamps() {
     setRamp(name, block);
     fbPos += count;
   }
-  const g = S.ramps.get('grey'), br = S.ramps.get('brown'), md = S.ramps.get('mud');
-  const boneIdx = [...new Set([g[0], br[1], md[2], md[4], md[5], md[7], md[8], md[10], md[11], br[11], md[13], md[14], md[15], g[12], g[13], g[15]])]
+  const g = S.ramps.get('grey'), md = S.ramps.get('mud');
+  const boneIdx = [...new Set([g[0], md[1], md[2], md[4], md[5], md[6], md[7], md[8], md[10], md[11], md[12], md[13], md[14], md[15], g[13], g[14]])]
     .sort((p, q) => lum(S.pal[p]) - lum(S.pal[q]));
   setRamp('bone', boneIdx, { alias: true });
   setRamp('fb_warm', Array.from({ length: 16 }, (_, j) => 224 + j).sort((p, q) => lum(S.pal[p]) - lum(S.pal[q])), { alias: true });
@@ -368,8 +368,9 @@ function blendHeightBuf(dst, src, pxMask, hmode, smoothR) {
     const v = src[i], hasPx = pxMask ? pxMask[i] >= 0 : false;
     if (hmode === 'add') { if (v !== 0) dst[i] += v; }
     else if (hmode === 'max') { if (v !== 0 || hasPx) dst[i] = Math.max(dst[i], v); }
-    else if (hmode === 'over') { if (v !== 0 || hasPx) dst[i] = v; }
+    else if (hmode === 'over' || hmode === 'set') { if (v !== 0 || hasPx) dst[i] = v; }
     else if (hmode === 'smin') { if (v !== 0) dst[i] = sminH(dst[i], v, smoothR || 2.5); }
+    else fail(`unknown height compose mode "${hmode}" (use add | max | over | set | smin)`);
   }
 }
 const activeHMap = () => (S.layers.length ? S.layers[S.activeLayer].hmap : S.hmap);
@@ -377,7 +378,7 @@ const markHChanged = () => { S.hchanged++; if (S.layers.length) S.layers[S.activ
 function initCanvas(w, h, fillIdx = 0) {
   S.w = w; S.h = h; S.px = new Uint8Array(w * h).fill(fillIdx); S.hmap = new Float32Array(w * h);
   S.layers = []; S.activeLayer = -1; S.belowPx = null; S.anchors.clear(); S.shapes.clear(); S.activeShape = null;
-  S.albedo = null; S.lightAccum = null; S.lastLights = [];
+  S.albedo = null; S.albedoLayer = -1; S.lightAccum = null; S.lastLights = [];
   S.undoStack = []; S.undoBytes = 0; S.checkpoints.clear(); S.lastDiff = null;
 }
 function compositeLayers(upto = S.layers.length - 1, outArr = new Uint8Array(S.w * S.h)) {
@@ -414,14 +415,14 @@ function syncLayers() {
 function snapState(label = '') {
   return {
     label, w: S.w, h: S.h, px: S.px.slice(), hmap: S.hmap.slice(),
-    albedo: S.albedo ? S.albedo.slice() : null,
+    albedo: S.albedo ? S.albedo.slice() : null, albedoLayer: S.albedoLayer,
     activeLayer: S.activeLayer, layers: S.layers.map((l) => ({ ...l, px: l.px.slice(), hmap: l.hmap ? l.hmap.slice() : new Float32Array(S.w * S.h) })),
     activeShape: S.activeShape, shapes: [...S.shapes].map(([k, v]) => [k, v.slice()]),
   };
 }
 function restoreState(st) {
   S.w = st.w; S.h = st.h; S.px = st.px.slice(); S.hmap = st.hmap.slice();
-  S.albedo = st.albedo ? st.albedo.slice() : null;
+  S.albedo = st.albedo ? st.albedo.slice() : null; S.albedoLayer = st.albedoLayer ?? -1;
   S.activeLayer = st.activeLayer; S.layers = st.layers.map((l) => ({ ...l, px: l.px.slice(), hmap: l.hmap ? l.hmap.slice() : new Float32Array(S.w * S.h) }));
   S.shapes = new Map((st.shapes || []).map(([k, v]) => [k, v.slice()])); S.activeShape = st.activeShape ?? null;
   syncLayers(); S.changed++;
@@ -488,8 +489,8 @@ function putShaded(x, y, srcColor, d, o) {
   if (!shSpec && !hiSpec) { if (d !== 0) putRel(x, y, srcColor, d); return; }
   const shifted = shadeIdx(srcColor, d);
   let outCol = shifted;
-  if (d < 0 && shSpec) outCol = mixColorTowardRamp(srcColor, shifted, shSpec, shSpec.mix * clamp(Math.abs(d) / 4, 0.35, 1));
-  else if (d > 0 && hiSpec) outCol = mixColorTowardRamp(srcColor, shifted, hiSpec, hiSpec.mix * clamp(d / 4, 0.35, 1));
+  if (d < 0 && shSpec) outCol = mixColorTowardRamp(srcColor, shifted, shSpec, shSpec.mix * (0.65 + 0.35 * clamp(Math.abs(d) / 4, 0, 1)));
+  else if (d > 0 && hiSpec) outCol = mixColorTowardRamp(srcColor, shifted, hiSpec, hiSpec.mix * (0.65 + 0.35 * clamp(d / 4, 0, 1)));
   put(x, y, outCol);
 }
 function putRel(x, y, srcColor, d) {
@@ -1818,8 +1819,10 @@ function heightCmd(a, o) {
     if (!S.layers.length) fail('height compose requires layers ("layer new ...")');
     const getL = (tok) => (/^\d+$/.test(tok) ? S.layers[parseInt(tok, 10)] : S.layers.find((l) => l.name === tok)) || fail(`no layer "${tok}"`);
     const src = getL(need(a[1], 'src layer')), dst = a[2] ? getL(a[2]) : S.layers[0];
-    blendHeightBuf(dst.hmap, src.hmap, src.kind === 'paint' ? src.px : null, o.mode || src.hmode || 'smin', kSmooth);
-    dst.hused = true; S.hchanged++; syncLayers();
+    if (src === dst) fail('height compose: source and destination layers must be different');
+    const cmode = o.mode || src.hmode || 'smin';
+    blendHeightBuf(dst.hmap, src.hmap, src.kind === 'paint' ? src.px : null, cmode, kSmooth);
+    dst.hused = true; src.hused = false; src.hmap.fill(0); S.hchanged++; syncLayers();
     return;
   }
   if (sub === 'clear') {
@@ -2161,28 +2164,47 @@ function localMeanDiff(hSrc, x, y, kernel) {
   for (const [dx, dy, w] of kernel.offs) meanH += getH(x + dx, y + dy, hSrc) * w;
   return meanH / kernel.wSum - h0;
 }
+function saveAlbedoSnapshot() {
+  if (!S.layers.length) { S.albedo = S.px.slice(); S.albedoLayer = -1; return; }
+  const L = S.layers[S.activeLayer];
+  S.albedo = (L.kind === 'base' ? L.px.slice() : compositeLayers(S.activeLayer));
+  S.albedoLayer = S.activeLayer;
+}
+function withAlbedoTargetLayer(fn) {
+  const prevIdx = S.activeLayer;
+  if (S.layers.length) {
+    const tgt = S.albedoLayer >= 0 && S.albedoLayer < S.layers.length ? S.albedoLayer : 0;
+    S.activeLayer = tgt;
+    syncLayers();
+  }
+  try { fn(); } finally {
+    if (S.layers.length) { S.activeLayer = prevIdx; syncLayers(); }
+  }
+}
 function finishLightAccum(ditherSpec) {
   if (!S.lightAccum || !S.lightAccum.active) fail('light end: no active "light begin" block');
   const A = S.lightAccum, W = S.w, H = S.h, D = ditherOpt(ditherSpec || A.dither || 'bayer4'), Q = quantizer(D, W);
   const allowedList = A.allowedRamps.size ? [...A.allowedRamps].flatMap((nm) => S.ramps.get(nm) || []) : [];
-  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
-    const idx = y * W + x;
-    if (!A.touched[idx]) continue;
-    const base = A.albedo[idx];
-    if (S.fullbright[base]) continue;
-    const q = Q(A.sumStep[idx], x, y, x, y);
-    let colIdx = q !== 0 ? shadeIdx(base, q) : base;
-    const tw = A.tintW[idx];
-    if (tw > 0.01) {
-      const blend = clamp(tw, 0, 1);
-      const tRgb = [A.tintR[idx] / tw, A.tintG[idx] / tw, A.tintB[idx] / tw];
-      const rgb = [0, 1, 2].map((k) => Math.round((1 - blend) * S.pal[colIdx][k] + blend * tRgb[k]));
-      const rm = S.rampOf[base];
-      const cand = rm ? [...new Set([...S.ramps.get(rm.name), ...allowedList])] : (allowedList.length ? allowedList : null);
-      colIdx = nearest(rgb, cand);
+  withAlbedoTargetLayer(() => {
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const idx = y * W + x;
+      if (!A.touched[idx]) continue;
+      const base = A.albedo[idx];
+      if (S.fullbright[base]) continue;
+      const q = Q(A.sumStep[idx], x, y, x, y);
+      let colIdx = q !== 0 ? shadeIdx(base, q) : base;
+      const tw = A.tintW[idx];
+      if (tw > 0.01) {
+        const blend = clamp(tw, 0, 1);
+        const tRgb = [A.tintR[idx] / tw, A.tintG[idx] / tw, A.tintB[idx] / tw];
+        const rgb = [0, 1, 2].map((k) => Math.round((1 - blend) * S.pal[colIdx][k] + blend * tRgb[k]));
+        const rm = S.rampOf[base];
+        const cand = rm ? [...new Set([...S.ramps.get(rm.name), ...allowedList])] : (allowedList.length ? allowedList : null);
+        colIdx = nearest(rgb, cand);
+      }
+      put(x, y, colIdx);
     }
-    put(x, y, colIdx);
-  }
+  });
   S.lastLights = A.cmds.slice();
   S.lightAccum = null;
 }
@@ -2217,6 +2239,8 @@ function lightHeight(o, record = true) {
   const accum = !!(S.lightAccum && S.lightAccum.active);
   if (accum) {
     if (record) S.lightAccum.cmds.push({ o: { ...o } });
+    if (o.dither !== undefined && !S.lightAccum.ditherSet) { S.lightAccum.dither = o.dither; S.lightAccum.ditherSet = true; }
+    if (targetRamp) S.lightAccum.allowedRamps.add(o.ramp);
     if (shSpec) S.lightAccum.allowedRamps.add(shSpec.name);
     if (hiSpec) S.lightAccum.allowedRamps.add(hiSpec.name);
     if (rimSpec) S.lightAccum.allowedRamps.add(rimSpec.name);
@@ -2242,9 +2266,11 @@ function lightHeight(o, record = true) {
     }
     let sf;
     const minNdotl = -Math.cos(el);
-    if (targetRamp && !accum) {
+    if (targetRamp) {
       const t = clamp((ndotl * litFactor - minNdotl) / Math.max(0.1, 1 - minNdotl), 0, 1);
-      sf = lo + (hi - lo) * t;
+      const tgtStep = lo + (hi - lo) * t;
+      const curStep = S.rampOf[c] ? S.rampOf[c].i : Math.round(brightnessOf(c) * (targetRamp.length - 1));
+      sf = accum ? (tgtStep - curStep) : tgtStep;
     } else {
       sf = ndotl >= Lz ? ((ndotl - Lz) / Math.max(0.05, 1 - Lz)) * hi : ((ndotl - Lz) / Math.max(0.15, Lz - minNdotl)) * (-lo);
       if (litFactor < 1 && sf > 0) sf *= litFactor;
@@ -2270,16 +2296,17 @@ function lightHeight(o, record = true) {
         const colRgb = S.pal[spec.ramp[clamp(Math.round(b * (spec.ramp.length - 1)), 0, spec.ramp.length - 1)]];
         A.tintR[idx] += colRgb[0] * w; A.tintG[idx] += colRgb[1] * w; A.tintB[idx] += colRgb[2] * w; A.tintW[idx] += w;
       };
-      if (shSpec && sf < 0) addTint(shSpec, shSpec.mix * clamp(Math.abs(sf) / 4, 0.35, 1));
-      if (hiSpec && sf > 0) addTint(hiSpec, hiSpec.mix * clamp(sf / 4, 0.35, 1));
+      if (targetRamp) addTint({ ramp: targetRamp, mix: 1 }, 1);
+      if (shSpec && sf < 0) addTint(shSpec, shSpec.mix * (0.65 + 0.35 * clamp(Math.abs(sf) / 4, 0, 1)));
+      if (hiSpec && sf > 0) addTint(hiSpec, hiSpec.mix * (0.65 + 0.35 * clamp(sf / 4, 0, 1)));
       if (rimSpec && rimSf > 0.05) addTint(rimSpec, rimSpec.mix * rimF);
       return;
     }
     const q = Q(sf + rimSf, x, y, i, j);
     if (targetRamp) { put(x, y, targetRamp[clamp(q, 0, targetRamp.length - 1)]); return; }
     let outCol = q !== 0 ? shadeIdx(c, q) : c;
-    if (shSpec && sf < -0.25) outCol = mixColorTowardRamp(c, outCol, shSpec, shSpec.mix * clamp(Math.abs(sf) / 4, 0.35, 1));
-    else if (hiSpec && sf > 0.25) outCol = mixColorTowardRamp(c, outCol, hiSpec, hiSpec.mix * clamp(sf / 4, 0.35, 1));
+    if (shSpec && sf < -0.25) outCol = mixColorTowardRamp(c, outCol, shSpec, shSpec.mix * (0.65 + 0.35 * clamp(Math.abs(sf) / 4, 0, 1)));
+    else if (hiSpec && sf > 0.25) outCol = mixColorTowardRamp(c, outCol, hiSpec, hiSpec.mix * (0.65 + 0.35 * clamp(sf / 4, 0, 1)));
     if (rimSpec && rimSf > 0.25) outCol = mixColorTowardRamp(c, outCol, rimSpec, rimSpec.mix * rimF);
     if (outCol !== c) put(x, y, outCol);
   });
@@ -2441,16 +2468,23 @@ function dripCmd(tok, o) {
   for (const [sx, sy] of seeds) {
     if (hash(sx, sy, seed, 301) >= dens) continue;
     const L = Math.round(lenLo + (lenHi - lenLo) * hash(sx, sy, seed, 302));
-    let cx = sx + dx, cy = sy + dy;
+    let cx = sx, cy = sy;
     for (let s = 1; s <= L; s++) {
-      const t = 1 - (s - 1) / Math.max(1, L);
+      const hCur = S.hchanged > 0 ? getH(cx, cy) : 0;
+      let nx = cx + dx, ny = cy + dy;
       if (hash(sx, sy, s, seed + 305) < 0.18) {
         const j = hash(sx, s, seed, 307) < 0.5 ? -1 : 1;
-        cx += pxOff * j; cy += pyOff * j;
+        nx += pxOff * j; ny += pyOff * j;
       }
+      if (s > 1 && S.hchanged > 0 && getH(nx, ny) > hCur + 1.5) {
+        if (getH(cx + dx + pxOff, cy + dy + pyOff) <= hCur + 1.5) { nx = cx + dx + pxOff; ny = cy + dy + pyOff; }
+        else if (getH(cx + dx - pxOff, cy + dy - pyOff) <= hCur + 1.5) { nx = cx + dx - pxOff; ny = cy + dy - pyOff; }
+        else break;
+      }
+      cx = nx; cy = ny;
+      const t = 1 - (s - 1) / Math.max(1, L);
       const hw = Math.floor(((wid - 1) * t) / 2);
       for (let w = -hw; w <= hw; w++) paintPx(cx + pxOff * w, cy + pyOff * w, t, s / L);
-      cx += dx; cy += dy;
     }
   }
 }
@@ -2874,8 +2908,8 @@ function lintCanvas(o) {
         jumps.push([wx, wy, Math.abs(rm.i - rn.i)]);
       }
     }
-    // 3. Isolated single-pixel noise (not part of regular checkerboard, thin 1px line, or convex height peak specular)
-    if (!S.fullbright[c] && !(c1x === cAt(x - 1, y) && c1y === cAt(x, y - 1))) {
+    // 3. Isolated single-pixel noise (not part of thin 1px line/same-color neighbor, fullbright, or convex height peak specular)
+    if (!S.fullbright[c]) {
       let isPeak = false;
       if (S.hchanged > 0) {
         const avgH = (getH(x + 1, y) + getH(x - 1, y) + getH(x, y + 1) + getH(x, y - 1)) / 4;
@@ -3276,8 +3310,8 @@ def('dfill', '<color> <pct> [bayer=2|4|8 | noise=SEED]', 'Pattern fill: paints p
 def('rough', 'mask=<shape> [amount=1..8] [prob=P] [side=both|in|out] [clump=N] [seed=N]', 'Make the edge of a shape irregular (erode / grow by seeded, clumped noise). Do this BEFORE bevel/height so light follows the broken edge.', (a, o) => { needCanvas(); rough(o); }, true);
 def('chip', 'mask=<shape> [prob=P] [size=1..3] [face=n] [seed=N]', 'Knock chunks off convex corners; face=n shades the freshly exposed pixels.', (a, o) => { needCanvas(); chip(o); }, true);
 def('smudge', '[radius=N] [strength=%] [dir=x|y|d1|d2|n|s|e|w…] [len=N] [passes=N] [protect=…] [blend=ramp|nearest ramps=a,b] [mask=…] [seed=N]', 'Blur inside the palette: mixes ramp steps of same-ramp neighbours, so stone never bleeds into moss. dir= gives a directional drag.', (a, o) => { needCanvas(); smudge(o); }, true);
-def('cavity', '[mask=<shape>] [against=<colors>] [radius=1..6] [lo=N] [min=%] [dither=…] [seed=N]', 'Ambient occlusion / contact shadow: darkens pixels crowded by what is outside the shape (or by "against" colors).', (a, o) => { needCanvas(); cavity(o); }, true);
-def('bevel', '[mask=<shape>] [region=x,y,w,h] [light=n|ne|e|se|s|sw|w|nw] [depth=N] [hi=N] [lo=N] [soft]', 'Edge lighting: edges facing the light get +hi ramp steps, edges facing away -lo. soft fades one step per pixel inward.', (a, o) => { needCanvas(); bevel(o); }, true, ['soft']);
+def('cavity', '[mask=<colors>] [shape=<expr>] [against=<colors>] [radius=1..6] [lo=N] [min=%] [shadow_ramp=<r[:pct%]>] [dither=…] [seed=N]', 'Ambient occlusion / contact shadow: darkens pixels crowded by what is outside mask=/against=.', (a, o) => { needCanvas(); cavity(o); }, true);
+def('bevel', '[mask=<colors>] [shape=<expr>] [region=x,y,w,h] [light=n|ne|e|se|s|sw|w|nw] [depth=N] [hi=N] [lo=N] [shadow_ramp=] [hi_ramp=] [soft]', 'Edge lighting: edges facing the light get +hi ramp steps, edges facing away -lo. soft fades one step per pixel inward.', (a, o) => { needCanvas(); bevel(o); }, true, ['soft']);
 def('height', 'inflate|bevel|add|set|scale|grad|noise|blur|from|compose|rect|ellipse|poly|stroke|curve|spline|crack|ribs|clear ...',
   'Sculpt the parallel height channel (supports mode=add|max|set|smin, branched cracks, and periodic ribs along curves).', (a, o) => {
   needCanvas(); heightCmd(a, o);
@@ -3298,38 +3332,41 @@ def('emit', '[mask=<emitters>] [radius=6] [ramp=<name>] [strength=75] [mode=mix|
   'Alias for "glow".', (a, o) => {
   needCanvas(); glowCmd(o);
 }, true, ['normal']);
-def('albedo', '[save|restore|clear]', 'Snapshot unlit base colors into S.albedo (or restore them) for non-destructive relighting.', (a) => {
+def('albedo', '[save|restore|clear]', 'Snapshot unlit base colors of active layer (preserving overlay paint_over layers above it on relight).', (a) => {
   needCanvas();
   const sub = a[0] || 'save';
-  if (sub === 'save') { S.albedo = S.px.slice(); out('albedo saved'); }
-  else if (sub === 'clear') { S.albedo = null; out('albedo cleared'); }
+  if (sub === 'save') { saveAlbedoSnapshot(); out('albedo saved'); }
+  else if (sub === 'clear') { S.albedo = null; S.albedoLayer = -1; out('albedo cleared'); }
   else if (sub === 'restore') {
     if (!S.albedo) fail('albedo restore: nothing saved (run "albedo save" or "light begin")');
-    for (let y = 0; y < S.h; y++) for (let x = 0; x < S.w; x++) put(x, y, S.albedo[y * S.w + x]);
+    withAlbedoTargetLayer(() => {
+      for (let y = 0; y < S.h; y++) for (let x = 0; x < S.w; x++) put(x, y, S.albedo[y * S.w + x]);
+    });
   } else fail('albedo must be save | restore | clear');
 });
-def('light', '[begin [reset] | end | height] [dir=nw] [elev=40] [range=-4..+3] [shadow_ramp=<r[:pct%]>] [hi_ramp=<r[:pct%]>] [rim=<dir>] [rim_ramp=<r[:pct%]>] [rim_strength=2] [spec=N] [ao=N] [shadow=N] ...',
-  'Shade using normals + optional hue-shifting + rim light. Wrap multiple lights in "light begin" ... "light end" for float accumulation over albedo.', (a, o) => {
+def('light', '[begin [keep] | end | height] [dir=nw] [elev=40] [range=-4..+3] [shadow_ramp=<r[:pct%]>] [hi_ramp=<r[:pct%]>] [rim=<dir>] [rim_ramp=<r[:pct%]>] [rim_strength=2] [spec=N] [ao=N] [shadow=N] ...',
+  'Shade using normals + optional hue-shifting + rim light. "light begin" snapshots current px unless "keep" is passed; "light end" quantizes accumulated lights.', (a, o) => {
   needCanvas();
   if (a[0] === 'begin') {
-    if (!S.albedo || o.reset || a.includes('reset')) S.albedo = S.px.slice();
+    const keep = a.includes('keep') || !!o.keep;
+    if (!keep || !S.albedo) saveAlbedoSnapshot();
     S.lightAccum = {
       active: true, albedo: S.albedo.slice(), sumStep: new Float32Array(S.w * S.h),
       tintR: new Float32Array(S.w * S.h), tintG: new Float32Array(S.w * S.h), tintB: new Float32Array(S.w * S.h), tintW: new Float32Array(S.w * S.h),
-      touched: new Uint8Array(S.w * S.h), allowedRamps: new Set(), dither: o.dither || 'bayer4', cmds: [],
+      touched: new Uint8Array(S.w * S.h), allowedRamps: new Set(), dither: o.dither || 'bayer4', ditherSet: o.dither !== undefined, cmds: [],
     };
     return;
   }
   if (a[0] === 'end') { finishLightAccum(o.dither); return; }
   lightHeight(o);
-}, true, ['reset']);
-def('relight', '[dither=bayer4]', 'Replay the saved light stack non-destructively over S.albedo and current S.hmap.', (a, o) => {
+}, true, ['reset', 'keep']);
+def('relight', '[dither=bayer4]', 'Replay the saved light stack non-destructively over S.albedo and current S.hmap (keeping paint_over layers above it).', (a, o) => {
   needCanvas();
   if (!S.albedo || !S.lastLights.length) fail('relight needs "albedo save" (or "light begin") and at least one prior "light" command');
   S.lightAccum = {
     active: true, albedo: S.albedo.slice(), sumStep: new Float32Array(S.w * S.h),
     tintR: new Float32Array(S.w * S.h), tintG: new Float32Array(S.w * S.h), tintB: new Float32Array(S.w * S.h), tintW: new Float32Array(S.w * S.h),
-    touched: new Uint8Array(S.w * S.h), allowedRamps: new Set(), dither: o.dither || 'bayer4', cmds: [],
+    touched: new Uint8Array(S.w * S.h), allowedRamps: new Set(), dither: o.dither || 'bayer4', ditherSet: o.dither !== undefined, cmds: [],
   };
   for (const item of S.lastLights) lightHeight(item.o, true);
   finishLightAccum(o.dither);
@@ -3402,7 +3439,7 @@ def('save', '<file.png> [scale=N] [tile=N]', 'Write an indexed 8-bit PNG (palett
 });
 
 // ─────────────────────────────────────────────────────────────── option parser, script runner, CLI
-const KNOWN = new Set('against all alpha amount angle angle_jitter ao ao_radius aspect axis bayer bevel bias bleed blend branch breakup bristles brush center chip clump cols color contrast count cross density depth dir dither elev face fill flow flow_jitter follow from gloss h height hi hi_mix hi_ramp hmode in jitter jump k len light light_mix light_ramp lip lo mask mid min mode mortar mortar_color n noise normal octaves opacity outline pad passes prob profile protect radial radius ramp ramps range region repeat reset ridge rim rim_elev rim_mix rim_ramp rim_strength rivets rot rough round rows scale scalex scaley scatter seed shade shade_jitter shadow shadow_mix shadow_ramp shape sharp side size size_jitter skip smooth soft spacing spec spread step strength style sym taper tex_scale thresh tile tilt tint to type vary view w warp width wobble'.split(' '));
+const KNOWN = new Set('against all alpha amount angle angle_jitter ao ao_radius aspect axis bayer bevel bias bleed blend branch breakup bristles brush center chip clump cols color contrast count cross density depth dir dither elev face fill flow flow_jitter follow from gloss h height hi hi_mix hi_ramp hmode in jitter jump k keep len light light_mix light_ramp lip lo mask mid min mode mortar mortar_color n noise normal octaves opacity outline pad passes prob profile protect radial radius ramp ramps range region repeat reset ridge rim rim_elev rim_mix rim_ramp rim_strength rivets rot rough round rows scale scalex scaley scatter seed shade shade_jitter shadow shadow_mix shadow_ramp shape sharp side size size_jitter skip smooth soft spacing spec spread step strength style sym taper tex_scale thresh tile tilt tint to type vary view w warp width wobble'.split(' '));
 const parseRegion = (v) => {
   const s = String(v);
   if (s.startsWith('anchor:')) {

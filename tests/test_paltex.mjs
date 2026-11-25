@@ -561,14 +561,14 @@ console.log('12. Testing bug fixes: separate Quake fullbrights + bone alias, gra
   assert.ok(im.px[24 * 64 + 39] >= 240 && im.px[24 * 64 + 39] <= 247, 'right sym=x mirrored fb_plasma eye');
 }
 
-console.log('13. Testing artistic Pass 2 tools: hue-shifted light/rim, light begin..end + albedo/relight, layer hmap smin, height crack/ribs, drip, wash, drybrush, hatch in=shadow...');
+console.log('13. Testing artistic Pass 2 tools with deep pixel/height verification (hue-shift light/cavity/bevel, rim, relight, smin, ribs, crack, drip terrain, wash, drybrush, hatch in=)...');
 {
   const outPng = path.join(SCRATCH, 't_pass2_tools.png');
   const stdout = runPTX(`
     palette quake
     new 64 64 slate:5
 
-    # Per-layer height with smooth union (smin): base dome + horns layer
+    # 1) Layer hmap smooth union (smin): base dome + horns layer merged cleanly
     shape base_dome new
     shape base_dome add ellipse 32 34 16 14
     shape base_dome fill bone:7
@@ -581,31 +581,43 @@ console.log('13. Testing artistic Pass 2 tools: hue-shifted light/rim, light beg
     height ribs 7 18,30 12,18 22,12 count=6 depth=2 size=6 taper=100,45 color=-2 hi=+1 sym=x axis=31.5
     layer merge
 
-    # Socket hole for drip + wash source
+    # Socket hole for drip
     shape socket new
     shape socket add ellipse 32 34 3 3
     shape socket fill slate:1
     height set -3 shape=socket
 
-    # Save unlit albedo, run multi-light block with hue-shifting (purple shadow + gold hi + teal rim)
+    # 2) Multi-light block with hue-shifting (purple shadow + gold hi + teal rim)
     albedo save
     light begin
-      light height dir=nw elev=40 range=-4..+4 shadow_ramp=purple:55% hi_ramp=gold:35% ao=2 shape=base_dome|horn
-      light height dir=se elev=25 range=0..+2 rim=se rim_ramp=teal:70% rim_strength=2 shape=base_dome|horn
+      light height dir=nw elev=40 range=-4..+4 shadow_ramp=purple:65% hi_ramp=gold:50% ao=2 shape=base_dome|horn
+      light height dir=se elev=25 range=0..+2 rim=se rim_ramp=teal:85% rim_strength=2 shape=base_dome|horn
     light end
 
-    # Carve branched crack with dark fissure & lit lip, then test relight over updated height
-    height crack 24,42 40,48 depth=3 width=1 branch=2 wobble=2 seed=5
-    relight
-    height crack 24,42 40,48 depth=2 width=1 branch=1 wobble=2 color=slate:0 lip=+2 seed=5
+    # 3) Check wash on a concave pit (top-right corner: outer ring height=5, inner 4x4 pit height=0)
+    rect 46 6 12 12 mud:7 fill
+    height set 5 region=46,6,12,12
+    height set 0 region=50,10,4,4
+    wash slate radius=2 strength=85 dither=none region=46,6,12,12
 
-    # Hand-painted weathering operators + shadow-only hatching
-    drip blood:5 shape=socket dir=s len=8..10 width=1 density=100 dither=none
-    wash slate radius=2 strength=60 dither=none shape=base_dome|horn
-    drybrush gold:13 thresh=0.5 strength=80 breakup=25 light=nw dither=none shape=base_dome|horn
-    hatch shape=base_dome in=shadow follow=contour spacing=3 shade=-1
+    # 4) Check drybrush/edgewear on convex ridge block (bottom-left: 6x6 block at height=6)
+    rect 6 46 8 8 mud:5 fill
+    height set 6 region=6,46,8,8
+    edgewear +4 thresh=0.4 strength=100 breakup=0 light=nw dither=none region=6,46,8,8
 
-    # Test shadow-only hatch on split dark/bright box: dark side hatches, bright grey:14 stays untouched
+    # 5) Check cavity with purple hue-shift at 60% mix
+    rect 24 4 8 8 grey:12 fill
+    rect 26 6 4 4 mud:8 fill
+    cavity mask=mud radius=2 lo=3 min=10 shadow_ramp=purple:60% dither=none region=24,4,8,8
+
+    # 6) Check branched crack with color & lip (on left cheek, separate from drip test zone)
+    height crack 16,32 24,38 depth=3 width=1 branch=2 wobble=2 color=slate:0 lip=+2 seed=5
+
+    # 7) Drip stopped/deflected by an elevated wall (bar at y=43 height=10 blocks downward drip from 32,37!)
+    height set 10 region=26,43,12,3
+    drip blood:5 shape=socket dir=s len=12..14 width=1 density=100 dither=none
+
+    # 8) Split dark/bright hatch in=shadow test
     rect 4 4 4 8 grey:2 fill
     rect 8 4 4 8 grey:14 fill
     hatch region=4,4,8,8 in=shadow spacing=1 shade=-1
@@ -614,15 +626,126 @@ console.log('13. Testing artistic Pass 2 tools: hue-shifted light/rim, light beg
     save "${outPng}" scale=2
   `);
   assert.match(stdout, /layer: created "horns" .* hmode=smin/);
-  assert.match(stdout, /albedo saved/);
   assert.match(stdout, /ok: .* 0 warning\(s\)/);
   const im = readPNGInfo(outPng);
-  // Blood drips below socket (y=38..42, x=32) landed downward onto bone/purple area -> blood ramp row 4 (64..79)
-  const dripPx = im.px[(40 * 2) * 128 + (32 * 2)];
-  assert.ok(dripPx >= 4 * 16 && dripPx < 5 * 16, `blood drip painted downward at 32,40 (got idx=${dripPx})`);
-  // Hatch in=shadow skipped bright grey:14 half at (10,6) -> stayed grey:14 (idx 14), shaded dark side < 2
-  assert.equal(im.px[(6 * 2) * 128 + (10 * 2)], 14, 'hatch in=shadow preserved bright grey:14 half');
-  assert.ok(im.px[(6 * 2) * 128 + (6 * 2)] < 2, 'hatch in=shadow darkened grey:2 half');
+  const pxAt = (x, y) => im.px[(y * 2) * 128 + (x * 2)];
+  const rampOfIdx = (i) => Math.floor(i / 16);
+  // Check rim teal (row 10 = 160..175) appeared on SE edge of dome (~46, 38..40) or shadow shifted toward purple (row 8 = 128..143)
+  let sawPurple = false, sawTeal = false;
+  for (let y = 20; y < 50; y++) for (let x = 16; x < 50; x++) {
+    const r = rampOfIdx(pxAt(x, y));
+    if (r === 8) sawPurple = true;
+    if (r === 10) sawTeal = true;
+  }
+  assert.ok(sawPurple, 'light shadow_ramp=purple shifted dome/horn shadow pixels into purple ramp');
+  assert.ok(sawTeal, 'light rim_ramp=teal painted grazing rim edge into teal ramp');
+
+  // Check wash darkened center of concave pit (51,11) relative to flat outer rim (47,7)
+  assert.ok(pxAt(51, 11) % 16 < pxAt(47, 7) % 16 || rampOfIdx(pxAt(51, 11)) === 2, 'wash darkened/tinted concave pit center');
+  // Check directional edgewear light=nw lifted NW top-left corner (6,46) more than SE corner (13,53)
+  assert.ok((pxAt(6, 46) % 16) > (pxAt(13, 53) % 16), 'edgewear light=nw brightened NW corner over SE corner');
+  // Check cavity at 60% mix shifted mud border pixels into purple (row 8) or darkened them
+  assert.ok(pxAt(26, 6) !== 11 * 16 + 8, 'cavity modified border of mud block at 60% mix');
+  // Check drip painted blood (row 4) before wall (around x=31..33, y=40), but did NOT cross tall barrier at y=43 to reach y=46
+  assert.ok([31, 32, 33].some((x) => rampOfIdx(pxAt(x, 40)) === 4), 'drip painted blood before barrier (y=40)');
+  assert.ok([30, 31, 32, 33, 34].every((x) => rampOfIdx(pxAt(x, 46)) !== 4), 'drip stopped before elevated wall at y=43');
+  // Check crack color landed (dark slate:0 = 32 on path start 16,32)
+  assert.equal(pxAt(16, 32), 32, 'crack painted start fissure slate:0');
+  // Check hatch in=shadow skipped bright grey:14 half, darkened grey:2 half
+  assert.equal(pxAt(10, 6), 14, 'hatch in=shadow preserved bright grey:14 half');
+  assert.ok(pxAt(6, 6) < 2, 'hatch in=shadow darkened grey:2 half');
+}
+
+console.log('14. Testing bug-fix regressions: height compose no-double, smin valley > max, light begin fresh vs keep, relight + paint_over, per-light ramp/dither, lint solitary [noise]...');
+{
+  // A) height compose without layer drop must equal height compose + layer drop, and mode=set works; smin valley > max
+  const hComposeKeep = runPTX(`
+    new 32 32 stone:4
+    height set 4 region=0,0,16,32
+    layer new dome2
+    height set 6 region=8,0,16,32
+    height compose dome2 base mode=max
+    dump view=height region=8,0,8,4
+  `);
+  const hComposeDrop = runPTX(`
+    new 32 32 stone:4
+    height set 4 region=0,0,16,32
+    layer new dome2
+    height set 6 region=8,0,16,32
+    height compose dome2 base mode=max
+    layer drop
+    dump view=height region=8,0,8,4
+  `);
+  const rangeRe = /height range: ([\d.-]+) \.\. ([\d.-]+)/;
+  assert.equal(hComposeKeep.match(rangeRe)[2], hComposeDrop.match(rangeRe)[2], 'height compose without layer drop does not double-apply height');
+
+  const hComposeSet = runPTX(`
+    new 16 16 stone:4
+    height set 8 region=0,0,16,16
+    layer new top
+    height set 3 region=4,4,8,8
+    height compose top base mode=set
+    dump view=height region=6,6,2,2
+  `);
+  assert.match(hComposeSet, /height range: 3\.00 \.\. 3\.00/, 'height compose mode=set overwrote destination with 3.00');
+
+  // B) smin valley height > max valley height right at equal-height midpoint (16,16)
+  const hMaxOut = runPTX(`
+    new 32 32 stone:4
+    height ellipse 12 16 6 6 6 fill soft
+    height ellipse 20 16 6 6 6 mode=max fill soft
+    zoom 16 16 1 1 view=height
+  `);
+  const hSminOut = runPTX(`
+    new 32 32 stone:4
+    height ellipse 12 16 6 6 6 fill soft
+    height ellipse 20 16 6 6 6 mode=smin k=3 fill soft
+    zoom 16 16 1 1 view=height
+  `);
+  const maxVal = parseFloat(hMaxOut.match(/height range: [\d.-]+ \.\. ([\d.-]+)/)[1]);
+  const sminVal = parseFloat(hSminOut.match(/height range: [\d.-]+ \.\. ([\d.-]+)/)[1]);
+  assert.ok(sminVal > maxVal + 0.3, `smin valley (${sminVal}) lifted cleanly above max (${maxVal})`);
+
+  // C) light begin captures fresh px (preserving new blood rect), light begin keep reuses old albedo, relight preserves paint_over, per-light ramp/dither work
+  const outPng = path.join(SCRATCH, 't_regressions.png');
+  const regOut = runPTX(`
+    palette quake
+    new 32 32 mud:6
+    height ellipse 5 5 3 3 4 fill soft
+    albedo save
+    # Draw blood AFTER albedo save; plain "light begin" must NOT clobber blood!
+    rect 2 2 6 6 blood:8 fill
+    light begin
+      light height dir=nw range=-2..+2 dither=none
+    light end
+    # Now explicitly test "keep" restores saved albedo, and per-light ramp=rust works inside light begin..end
+    light begin keep
+      light height dir=nw range=2..10 ramp=rust dither=none region=16,0,16,32
+    light end
+    # Paint overlay detail ABOVE base, add height bump, then relight -> base updates & overlay detail survives!
+    layer new paint_over
+    rect 4 16 4 4 fb_lava:6 fill
+    rect 10 16 4 4 blood:12 fill
+    height ellipse 20 20 4 4 6 fill soft
+    relight
+    save "${outPng}"
+  `);
+  assert.match(regOut, /ok: .* 0 warning\(s\)/);
+  const imReg = readPNGInfo(outPng);
+  // (4,4) stayed in blood ramp (row 4: 64..79) after first light begin
+  assert.equal(Math.floor(imReg.px[4 * 32 + 4] / 16), 4, 'fresh light begin preserved newly painted blood rect');
+  // (20,20) inside right half painted by per-light ramp=rust (row 5: 80..95)
+  assert.equal(Math.floor(imReg.px[20 * 32 + 20] / 16), 5, 'per-light ramp=rust worked inside light begin..end');
+  // (11,17) on paint_over layer survived relight untouched (blood:12 = 76)
+  assert.equal(imReg.px[17 * 32 + 11], 4 * 16 + 12, 'relight preserved paint_over overlay layer');
+
+  // D) lint catches solitary pixel [noise] on flat uniform background
+  const lintOut = runPTX(`
+    new 16 16 stone:6
+    pixel 8 8 stone:15
+    lint
+  `);
+  assert.match(lintOut, /\[noise\] 1 isolated pixel\(s\): 8,8/);
 }
 
 fs.rmSync(SCRATCH, { recursive: true, force: true });

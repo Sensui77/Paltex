@@ -223,7 +223,7 @@ O canal de altura (`S.hmap`) armazena relevo contínuo paralelo ao canvas de ín
 | `height stroke\|curve\|spline <val> <x,y>... [size=3] [taper=] [soft] [ridge] [closed] [mode=add\|max\|set\|smin]` | Esculpe sulcos negativos (`-4`) ou cristas positivas (`+5`, `ridge`) diretamente no canal de altura (com suporte a `sym`). |
 | `height ribs <val> <x,y> <x,y> ... [count=8] [depth=2] [size=6] [taper=100,35] [sharp=50] [color=<c>] [hi=<c>] [mode=...]` | Gera gomos/anéis periódicos esculpidos ao longo de uma curva (ideal para chifres, cabos, correntes e vértebras) em 1 linha. |
 | `height crack <x0,y0> <x1,y1> [depth=3] [width=1] [branch=2] [wobble=2.5] [color=<c>] [lip=<+n\|c>] [seed=N]` | Cria fissura ramificada gravando vale no `hmap`, opcionalmente escurecendo a fenda e iluminando a borda (`lip=`). |
-| `height compose <srcLayer> [dstLayer] [mode=smin\|max\|add\|over] [k=3]` | Compõe explicitamente o relevo entre camadas. |
+- `height compose <srcLayer> [dstLayer] [mode=smin|max|add|over|set] [k=3]` | Compõe o relevo da camada fonte na camada destino e zera a fonte para evitar aplicação duplicada. |
 | `height rect\|ellipse\|poly` / `height grad <x0> <y0> <x1> <y1> [from=0 to=4] [mode=linear\|radial] [radial]` | Desenha formas geométricas ou planos inclinados diretamente no relevo ativo. |
 | `height add <val> [mask=] [region=]` | Soma `val` (pode ser negativo, ex.: `height add -4 mask=socket`). |
 | `height set <val> [mask=] [region=]` | Define altura fixa no escopo. |
@@ -245,7 +245,7 @@ light end
 ```
 - `shadow_ramp=<ramp[:pct%]>` / `hi_ramp=<ramp[:pct%]>` (`light_ramp=`): deslocamento automático de matiz (*hue-shifting*) em sombras e realces dentro da paleta (também aceito em `cavity`, `bevel` e `grad shade`).
 - `rim=<dir>` / `rim_ramp=<ramp[:pct%]>` / `rim_strength=`: luz de recorte (*rim light*) em arestas rasantes.
-- **`light begin ... light end` + `albedo [save|restore|clear]` + `relight`**: acumula múltiplas fontes de luz em ponto flutuante sobre o albedo sem dupla quantização, e permite reiluminar após ajustes em `S.hmap`.
+- **`light begin [keep] ... light end` + `albedo [save|restore|clear]` + `relight`**: acumula múltiplas fontes de luz em ponto flutuante sobre o albedo sem dupla quantização (`light begin` tira snapshot novo por padrão, use `keep` para reutilizar o último `albedo save`), preservando camadas de acabamento (`paint_over`) acima da camada iluminada ao rodar `relight`.
 - `dir=n|ne|e|se|s|sw|w|nw` e `elev=1..89` (graus acima do horizonte).
 - `range=lo..hi` (ou `from=` / `to=`): deslocamento em degraus relativo ao plano horizontal (`sin(elev)` fica em `0` para não alterar superfícies planas), ou mapeamento absoluto quando `ramp=<nome>` é informado.
 - `strength=100`: escala da inclinação das normais Sobel 3×3.
