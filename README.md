@@ -15,9 +15,10 @@ Todo pixel do canvas é um **índice de paleta 8-bit (`0..255`)**: nenhuma opera
 - [5. Sprites por Degrau, Captura (`grab`) e Camada de Luz (`stamp shade`)](#5-sprites-por-degrau-captura-grab-e-camada-de-luz-stamp-shade)
 - [6. Volume Real (`height`), Iluminação (`light`) e Hachura (`hatch`)](#6-volume-real-height-iluminação-light-e-hachura-hatch)
 - [7. Atalhos de Fluxo: Simetria, Camadas, Undo e Checkpoints](#7-atalhos-de-fluxo-simetria-camadas-undo-e-checkpoints)
-- [8. Inspeção, Trace Visual e Lint](#8-inspeção-trace-visual-e-lint)
-- [9. Textura Procedural e Filtros 2D](#9-textura-procedural-e-filtros-2d)
-- [10. Exemplo Completo (Parede com Crânio Estilo Quake)](#10-exemplo-completo-parede-com-crânio-estilo-quake)
+- [8. Inspeção, Trace Visual, Estado e Lint](#8-inspeção-trace-visual-e-lint)
+- [9. Canal de Material (`material` / `mat=` / `mortar_mat=`)](#9-canal-de-material-material--mat--mortar_mat)
+- [10. Textura Procedural e Filtros 2D](#10-textura-procedural-e-filtros-2d)
+- [11. Exemplo Completo (Parede com Crânio Estilo Quake)](#11-exemplo-completo-parede-com-crânio-estilo-quake)
 
 ---
 
@@ -306,11 +307,10 @@ sym off
 ---
 
 ## 8. Inspeção, Trace Visual, Estado e Lint
-
 - `dump [view=char|idx|step|height|luma|halfblock] [scale=N] [region=x,y,w,h|anchor:nome]` e `zoom <x> <y> <w> <h> [view=...] [scale=N]` — inspecione silhuetas em ASCII, mapa de luminância (`view=luma`), minimapa ANSI truecolor (`halfblock`) ou relevo (`height`), opcionalmente reduzido com `scale=N`.
 - `bounds [bg=<cor>] [shape=…] [mask=…] [region=…]`: retorna a caixa delimitadora exata e a cobertura dos pixels não-fundo.
-- `probe <x> <y>`: inspeciona um pixel único (índice, hex, RGB, luminância, `rampa:passo`, altura `hmap`, camada ativa e `shapes`).
-- `state save <arquivo.ptxs>` / `state load <arquivo.ptxs>`: serializa ou restaura todo o estado binário (canvas, `hmap`, camadas, paleta, rampas, `shapes`, âncoras e sprites) entre execuções.
+- `probe <x> <y>`: inspeciona um pixel único (índice, hex, RGB, luminância, `rampa:passo`, altura `hmap`, camada ativa, `shapes` **e `mat=<nome>`** quando o pixel tem material atribuído).
+- `state save <arquivo.ptxs>` / `state load <arquivo.ptxs>`: serializa ou restaura todo o estado binário (canvas, `hmap`, **buffer de material `S.mat`**, **tabela de materiais**, camadas [incluindo `.mat` por camada], paleta, rampas, `shapes`, âncoras e sprites) entre execuções.
 - `include <arquivo.ptx>`: executa comandos de outro script `.ptx` no estado atual (com detecção de ciclo).
 - `sheet <arquivo.png> [scale=3] [pad=8]` (ou flag CLI `--sheet <arquivo.png>`): gera uma folha de contato RGB PNG com **1×**, **N× com réguas**, **2×2 tiled** e **mapa de altura**.
 - `seam`: mede o salto médio de cor nas bordas `x` e `y` comparado ao interior do tile.
@@ -334,18 +334,95 @@ sym off
 - **`stamp_along` / `scatter_along`**: `<sprite|sp1,sp2> curve|spline|line <p1 p2 ...> [count=N] [spacing=N] [rot=follow|random|DEG] [jitter=N] [seed=N]` — distribui sprites ao longo de curvas/linhas, alinhando à tangente local com `rot=follow` (e rotação em ângulo arbitrário no `stamp`).
 - **Modo estrito (`--strict` ou `strict on|off`)**: transforma qualquer `warning` (opção desconhecida, comando que alterou 0 pixels, `height` sem alterações) em erro fatal com código de saída `!= 0`.
 
-### Canal de Material (`material` / `mat=`)
-- `material <nome> [ramp=…] [spec=N] [gloss=N] [shadow_ramp=…] [hi_ramp=…]`: define propriedades físicas e de hue-shift para um material semântico.
-- `material fill <nome> [mask=…] [shape=…] [region=…]` / `material list`: aplica um material a uma área existente ou lista os materiais definidos.
-- **Escrita paralela (`mat=<nome>`)**: comandos de desenho (`rect`, `ellipse`, `poly`, `flood`, `shape fill`, `stroke`, `stamp`, `masonry` com `mat=` e `mortar_mat=`) gravam o ID do material no buffer paralelo `S.mat` (`Uint8Array`), preservado em camadas, `undo`, `checkpoint`, `shift`/`flip`/`resize` e `.ptxs`.
-- **Escopo e `light` guiado por material**: `hatch mat=bone follow=contour in=shadow` (ou `mat=a,b`, `mat=!bone`) filtra pelo ID semântico mesmo após hue-shift; `light` lê automaticamente `spec`, `gloss`, `shadow_ramp`, `hi_ramp` e `ramp` de cada pixel.
+### Canal de Material (`material` / `mat=` / `mortar_mat=`)
+O buffer paralelo `S.mat` (`Uint8Array`, um ID `0..255` por pixel) associa regiões a propriedades físicas/de luz sem depender da cor atual — sobrevive a hue-shift, `light`, `cavity` e qualquer reescrita de índice.
+
+#### Definição de materiais
+
+```text
+material bone ramp=bone spec=1.5 gloss=22 shadow_ramp=purple:55% hi_ramp=gold:40%
+material iron ramp=slate spec=3   gloss=48 shadow_ramp=slate:50%  hi_ramp=rust:30%
+material list        # lista todos os materiais e seus IDs
+```
+
+| Opção | Descrição |
+|---|---|
+| `ramp=<nome>` | Rampa padrão para remapeamento de cor por `light` neste material. |
+| `spec=N` | Intensidade especular Blinn-Phong (padrão global se omitido). |
+| `gloss=N` | Expoente de brilho especular (padrão global se omitido). |
+| `shadow_ramp=<r[:pct%]>` | Hue-shift automático nas sombras para esta região. |
+| `hi_ramp=<r[:pct%]>` | Hue-shift automático nos realces para esta região. |
+
+#### Escrita do ID (`mat=` nos comandos de desenho)
+
+Qualquer comando de desenho aceita `mat=<nome>` para gravar o ID no buffer `S.mat` enquanto pinta pixels:
+
+```text
+rect  4  8 24 48 bone:6 fill mat=bone   # pinta E marca pixels como "bone"
+rect 36  8 24 48 slate:7 fill mat=iron  # pinta E marca pixels como "iron"
+flood 10 10 rust:5 mat=rust             # flood também grava material
+stamp escudo 32 32 center mat=iron      # stamp grava material em todos os pixels opacos
+```
+
+`masonry` e `plates` aceitam **dois** IDs distintos:
+
+```text
+masonry slate w=32 h=16 mat=iron mortar_mat=bone
+# → pixels de tijolo recebem mat=iron, pixels de argamassa recebem mat=bone
+```
+
+`mat=` **não filtra** quais pixels o comando visita — ele apenas escreve o ID nos pixels que o comando já pintaria normalmente.
+
+#### Flood-fill de ID em área existente
+
+```text
+material fill bone mask=bone region=0,0,64,64
+# → marca todos os pixels da rampa bone na região como material "bone"
+# sem alterar nenhuma cor
+```
+
+#### Escopo por material (`mat=` como filtro de leitura)
+
+Em comandos de **filtro** (`hatch`, `cavity`, `bevel`, `noise`, `grad`, `wash`, `drybrush`, `drip`, etc.), `mat=<nome>` age como filtro de leitura — semelhante a `mask=`, mas usando o ID semântico em vez da cor:
+
+```text
+hatch -2 mat=bone follow=contour in=shadow spacing=2
+# → risca APENAS os pixels marcados como "bone", mesmo que light os tenha
+#   recolorido para purple ou grey por hue-shift
+
+cavity mat=iron radius=3 shadow_ramp=slate:40%
+# → AO apenas nos pixels de ferro
+
+noise slate mat=stone type=value scale=12 from=3 to=7
+# → ruído apenas nos pixels de pedra
+```
+
+Sintaxe do filtro `mat=`: `mat=bone` (único), `mat=bone,iron` (lista), `mat=!bone` (negação).
+
+#### `light` guiado por material (automático)
+
+Quando `S.mat` tem IDs definidos, `light height` consulta automaticamente `spec`, `gloss`, `ramp`, `shadow_ramp` e `hi_ramp` **por pixel** sem nenhuma opção extra:
+
+```text
+material bone ramp=bone spec=1.5 gloss=22 shadow_ramp=purple:55% hi_ramp=gold:40%
+material iron ramp=slate spec=3   gloss=48 shadow_ramp=slate:50%  hi_ramp=rust:30%
+rect  4  8 24 48 bone:6 fill mat=bone
+rect 36  8 24 48 slate:7 fill mat=iron
+height ellipse 20 32 10 18 8 fill soft   # domo em cada metade
+light height dir=nw elev=35 range=-4..+4 dither=none
+# → metade bone: sombra roxa, realce dourado, spec=1.5
+# → metade iron: sombra slate, realce enferrujado, spec=3 — tudo em 1 chamada
+```
+
+#### Persistência
+
+`state save` / `state load` preservam `S.mat`, a tabela de materiais e os buffers `.mat` de cada camada. `probe x y` exibe `mat=<nome>` quando o pixel tem material atribuído. `resize`, `shift` e `flip` propagam `S.mat` e os `.mat` por camada.
 
 ---
 
-## 9. Textura Procedural e Filtros 2D
-
-- `masonry <ramp> [style=running|grid|ashlar] [w=32 h=16 | cols=N rows=N] [mortar=2] [mortar_color=<c>] [bevel=3] [height=5] [vary=2] [tilt=1] [rough=1.8] [chip=35] [rivets] [seed=N]` — gera alvenaria/blocos sem costuras escrevendo cor + relevo orgânico chanfrado por bloco no canal de altura.
-- `plates <ramp> [w=32 h=32 | cols=N rows=N] [mortar=1] [bevel=2] [height=4] [vary=1] [tilt=1] [rivets] [seed=N]` — atalho para chapas metálicas rebitadas.
+## 10. Textura Procedural e Filtros 2D
+- `masonry <ramp> [style=running|grid|ashlar] [w=32 h=16 | cols=N rows=N] [mortar=2] [mortar_color=<c>] [bevel=3] [height=5] [vary=2] [tilt=1] [rough=1.8] [chip=35] [rivets] [seed=N] [mat=<nome>] [mortar_mat=<nome>]` — gera alvenaria/blocos sem costuras escrevendo cor + relevo orgânico chanfrado por bloco no canal de altura. `mat=` grava o ID de material nos pixels de tijolo; `mortar_mat=` grava o ID nos pixels de argamassa (IDs distintos permitem que `hatch mat=iron` ou `light` tratem tijolos e argamassa diferentemente).
+- `plates <ramp> [w=32 h=32 | cols=N rows=N] [mortar=1] [bevel=2] [height=4] [vary=1] [tilt=1] [rivets] [seed=N] [mat=<nome>] [mortar_mat=<nome>]` — atalho para chapas metálicas rebitadas (aceita os mesmos `mat=` / `mortar_mat=` que `masonry`).
 - `glow` / `emit` `[mask=<emissores>] [radius=6] [ramp=<nome>] [strength=75] [mode=mix|rgb|tint|shade] [dither=bayer4] [normal] [ramps=a,b]` — projeta luz local ao redor de pixels fullbright (ou da `mask=`), opcionalmente modulada pelas normais de `height` (`normal`).
 - `grad <ramp|shade> <x0> <y0> <x1> <y1> [from=a to=b] [dither=...] [mode=linear|radial] [radial] [tint [prob=P]]` *(use `mode=radial` ou `radial` para poder combinar livremente com `shape=<expr>`)*
 - `noise <ramp|shade> [type=value|turbulence|ridged|voronoi|cracks|cells] [scale=N|scalex=N scaley=N] [octaves=1..6] [warp=N] [from=a to=b] [contrast=%] [bias=%] [seed=N] [tint [prob=P]]`
@@ -365,8 +442,7 @@ sym off
 
 ---
 
-## 10. Exemplo Completo (Parede com Crânio Estilo Quake)
-
+## 11. Exemplo Completo (Parede com Crânio Estilo Quake)
 ```text
 palette quake
 new 128 128 slate:4

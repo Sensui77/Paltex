@@ -4005,8 +4005,8 @@ def('dfill', '<color> <pct> [bayer=2|4|8 | noise=SEED]', 'Pattern fill: paints p
 def('rough', 'mask=<shape> [amount=1..8] [prob=P] [side=both|in|out] [clump=N] [seed=N]', 'Make the edge of a shape irregular (erode / grow by seeded, clumped noise). Do this BEFORE bevel/height so light follows the broken edge.', (a, o) => { needCanvas(); rough(o); }, true);
 def('chip', 'mask=<shape> [prob=P] [size=1..3] [face=n] [seed=N]', 'Knock chunks off convex corners; face=n shades the freshly exposed pixels.', (a, o) => { needCanvas(); chip(o); }, true);
 def('smudge', '[radius=N] [strength=%] [dir=x|y|d1|d2|n|s|e|w…] [len=N] [passes=N] [protect=…] [blend=ramp|nearest ramps=a,b] [mask=…] [seed=N]', 'Blur inside the palette: mixes ramp steps of same-ramp neighbours, so stone never bleeds into moss. dir= gives a directional drag.', (a, o) => { needCanvas(); smudge(o); }, true);
-def('cavity', '[mask=<colors>] [shape=<expr>] [against=<colors>] [radius=1..6] [lo=N] [min=%] [shadow_ramp=<r[:pct%]>] [dither=…] [seed=N]', 'Ambient occlusion / contact shadow: darkens pixels crowded by what is outside mask=/against=.', (a, o) => { needCanvas(); cavity(o); }, true);
-def('bevel', '[mask=<colors>] [shape=<expr>] [region=x,y,w,h] [light=n|ne|e|se|s|sw|w|nw] [depth=N] [hi=N] [lo=N] [shadow_ramp=] [hi_ramp=] [soft]', 'Edge lighting: edges facing the light get +hi ramp steps, edges facing away -lo. soft fades one step per pixel inward.', (a, o) => { needCanvas(); bevel(o); }, true, ['soft']);
+def('cavity', '[mask=<colors>] [shape=<expr>] [mat=<name>|!name|a,b] [against=<colors>] [radius=1..6] [lo=N] [min=%] [shadow_ramp=<r[:pct%]>] [dither=…] [seed=N]', 'Ambient occlusion / contact shadow: darkens pixels crowded by what is outside mask=/against=. mat= restricts by semantic material ID (survives hue-shift).', (a, o) => { needCanvas(); cavity(o); }, true);
+def('bevel', '[mask=<colors>] [shape=<expr>] [mat=<name>|!name|a,b] [region=x,y,w,h] [light=n|ne|e|se|s|sw|w|nw] [depth=N] [hi=N] [lo=N] [shadow_ramp=] [hi_ramp=] [soft]', 'Edge lighting: edges facing the light get +hi ramp steps, edges facing away -lo. soft fades one step per pixel inward. mat= restricts by semantic material ID.', (a, o) => { needCanvas(); bevel(o); }, true, ['soft']);
 def('height', 'inflate|bevel|add|set|scale|grad|noise|blur|from|compose|rect|ellipse|poly|stroke|curve|spline|crack|ribs|clear ...',
   'Sculpt the parallel height channel (supports mode=add|max|set|smin, branched cracks, and periodic ribs along curves).', (a, o) => {
   needCanvas(); heightCmd(a, o);
@@ -4066,8 +4066,8 @@ def('relight', '[dither=bayer4]', 'Replay the saved light stack non-destructivel
   for (const item of S.lastLights) lightHeight(item.o, true);
   finishLightAccum(o.dither);
 }, true);
-def('hatch', '[color] [in=all|shadow|mid|light] [mask=…] [region=…] [follow=none|contour|slope] [angle=-30] [spacing=3] [shade=-1] [jitter=1] [cross] [seed=N]',
-  'Draw directional or contour-following hatch strokes (optionally limited to shadow/mid/light tones).', (a, o) => {
+def('hatch', '[color] [in=all|shadow|mid|light] [mask=…] [mat=<name>|!name|a,b] [region=…] [follow=none|contour|slope] [angle=-30] [spacing=3] [shade=-1] [jitter=1] [cross] [seed=N]',
+  'Directional hatching on canvas using height map. mat= filters by semantic material ID (survives hue-shift). in= limits to shadow/mid/light zones.', (a, o) => {
   needCanvas(); hatch(a[0], o);
 }, true, ['cross']);
 def('drip', '[color|ramp|shade] [from=cavity|mask|all] [dir=s|n|e|w] [len=6..16] [width=1..3] [density=45] [shade=-3] [tint] [dither=…] [protect=…] [seed=N]',
@@ -4106,8 +4106,8 @@ def('scatter_along', '<sp1,sp2,...> <curve|spline|line> <p1 p2 ...> [count=N] [s
   'Scatter sprites randomly from a list along a line, curve, or spline.', (a, o) => {
   needCanvas(); stampAlongCmd(a, o, true);
 }, true, ['closed', 'flipx', 'flipy', 'center']);
-def('material', '<name> [ramp=…] [spec=N] [gloss=N] [shadow_ramp=…] [hi_ramp=…] | fill <name> [mask=…] [shape=…] [region=…] | list',
-  'Define per-pixel material properties (used automatically by light) or tag pixels in S.mat.', (a, o) => {
+def('material', '<name> [ramp=<nome>] [spec=N] [gloss=N] [shadow_ramp=<r[:pct%]>] [hi_ramp=<r[:pct%]>] | fill <name> [mask=…] [shape=…] [region=…] | list',
+  'Define per-pixel material (used automatically by light). mat=<name> on draw cmds (rect/ellipse/flood/stamp/masonry/plates etc.) writes the ID to the parallel S.mat buffer. mat= on filter cmds (hatch/cavity/bevel/noise/grad/wash/drip/drybrush) restricts to pixels with that material ID — survives hue-shift. masonry/plates accept mat= (bricks) and mortar_mat= (joints). material fill <name> flood-tags an existing region. material list shows all defined materials.', (a, o) => {
   const sub = need(a[0], 'name|fill|list');
   if (sub === 'list') {
     if (!S.materials.size) return out('materials: (none)');
@@ -4156,10 +4156,10 @@ def('zoom', '<x> <y> <w> <h> [view=char|idx|step|height|luma|halfblock] [scale=N
   show(coord(a[0], 'x', 'x'), coord(a[1], 'y', 'y'), coord(a[2], 'w', 'x'), coord(a[3], 'h', 'y'), o.view || 'char', 1, sc);
 });
 def('bounds', '[bg=<color>] [shape=…] [mask=…] [region=…]', 'Report the tight bounding box of non-background (or scoped) pixels.', (a, o) => boundsCmd(o));
-def('probe', '<x> <y>', 'Inspect a single pixel: palette index, hex, RGB, luma, ramp:step, height, layer, shapes.', (a) => {
+def('probe', '<x> <y>', 'Inspect a single pixel: palette index, hex, RGB, luma, ramp:step, height (hmap), active layer, shapes, and mat=<name> when the pixel has a material ID in S.mat.', (a) => {
   probeCmd(coord(a[0], 'x', 'x'), coord(a[1], 'y', 'y'));
 });
-def('state', 'save <file.ptxs> | load <file.ptxs>', 'Serialize or restore the full binary canvas/height/layers/palette/shapes state.', (a) => {
+def('state', 'save <file.ptxs> | load <file.ptxs>', 'Serialize or restore the full binary state: canvas, hmap, S.mat (material ID buffer), material table, layers (including per-layer .mat), palette, ramps, shapes, anchors, sprites.', (a) => {
   const sub = need(a[0], 'save|load'), f = need(a[1], 'file.ptxs');
   if (sub === 'save') savePtxs(f);
   else if (sub === 'load') loadPtxs(f);
