@@ -935,6 +935,53 @@ console.log('16. Bloco 4 (linguagem): let, math exprs, for/repeat, macro, stamp_
   }, '--strict failed on unknown option warning');
 }
 
+// ── 17. Bloco 4 (material / mat=): parallel ID buffer, scope mat=, light per-material, masonry mat=, ptxs
+console.log('17. Bloco 4 (material): S.mat ID buffer, mat= write & scope, light per-material, masonry, ptxs');
+{
+  const matPng = path.join(SCRATCH, 'mat_test.png');
+  const matPtxs = path.join(SCRATCH, 'mat_state.ptxs');
+  const matOut = runPTX(`
+    palette quake
+    new 64 64 slate:3
+    material bone ramp=bone spec=1.5 gloss=22 shadow_ramp=purple:55% hi_ramp=gold:40%
+    material iron ramp=slate spec=3 gloss=48 shadow_ramp=slate:50% hi_ramp=rust:30%
+    # Paint bone left half (with mud/bone colors) and iron right half
+    rect 4 8 24 48 bone:6 fill mat=bone
+    rect 36 8 24 48 slate:7 fill mat=iron
+    # Sculpt domes on both halves
+    height ellipse 16 32 10 18 8 fill soft
+    height ellipse 48 32 10 18 8 fill soft
+    # Single light call automatically applies purple shadow_ramp + gold hi_ramp on bone, rust hi_ramp on iron
+    light height dir=nw elev=35 range=-4..+4 dither=none
+    # Now hatch ONLY mat=bone in=shadow — works even where light hue-shifted bone to purple!
+    hatch -2 mat=bone follow=contour in=shadow spacing=2
+    probe 16 32
+    state save "${matPtxs.replace(/\\/g, '/')}"
+    save "${matPng.replace(/\\/g, '/')}"
+  `);
+  assert.match(matOut, /ok: .* 0 warning\(s\)/);
+  assert.match(matOut, /probe 16,32: .* mat=bone/);
+  const imMat = readPNGInfo(matPng);
+  // Check bone shadow side (se of dome center, e.g. 22,40) hue-shifted toward purple (row 8) or dark mud/grey
+  // Check iron highlight side (nw of dome center, e.g. 42,24) got brighter / rust tint
+  const boneLit = imMat.px[24 * 64 + 10];
+  const boneShadow = imMat.px[40 * 64 + 22];
+  assert.notEqual(boneLit, boneShadow, 'material-guided light shaded bone dome');
+  // Verify iron half wasn't touched by hatch mat=bone
+  // Verify state load preserves mat=bone and mat=iron
+  const matReloadOut = runPTX(`
+    state load "${matPtxs.replace(/\\/g, '/')}"
+    probe 16 32
+    probe 48 32
+    masonry slate cols=2 rows=2 rough=0 mat=iron mortar_mat=bone
+    probe 20 20
+  `);
+  assert.match(matReloadOut, /probe 16,32: .* mat=bone/);
+  assert.match(matReloadOut, /probe 48,32: .* mat=iron/);
+  assert.match(matReloadOut, /probe 20,20: .* mat=iron/);
+}
+
+
 
 
 fs.rmSync(SCRATCH, { recursive: true, force: true });

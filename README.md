@@ -334,6 +334,12 @@ sym off
 - **`stamp_along` / `scatter_along`**: `<sprite|sp1,sp2> curve|spline|line <p1 p2 ...> [count=N] [spacing=N] [rot=follow|random|DEG] [jitter=N] [seed=N]` — distribui sprites ao longo de curvas/linhas, alinhando à tangente local com `rot=follow` (e rotação em ângulo arbitrário no `stamp`).
 - **Modo estrito (`--strict` ou `strict on|off`)**: transforma qualquer `warning` (opção desconhecida, comando que alterou 0 pixels, `height` sem alterações) em erro fatal com código de saída `!= 0`.
 
+### Canal de Material (`material` / `mat=`)
+- `material <nome> [ramp=…] [spec=N] [gloss=N] [shadow_ramp=…] [hi_ramp=…]`: define propriedades físicas e de hue-shift para um material semântico.
+- `material fill <nome> [mask=…] [shape=…] [region=…]` / `material list`: aplica um material a uma área existente ou lista os materiais definidos.
+- **Escrita paralela (`mat=<nome>`)**: comandos de desenho (`rect`, `ellipse`, `poly`, `flood`, `shape fill`, `stroke`, `stamp`, `masonry` com `mat=` e `mortar_mat=`) gravam o ID do material no buffer paralelo `S.mat` (`Uint8Array`), preservado em camadas, `undo`, `checkpoint`, `shift`/`flip`/`resize` e `.ptxs`.
+- **Escopo e `light` guiado por material**: `hatch mat=bone follow=contour in=shadow` (ou `mat=a,b`, `mat=!bone`) filtra pelo ID semântico mesmo após hue-shift; `light` lê automaticamente `spec`, `gloss`, `shadow_ramp`, `hi_ramp` e `ramp` de cada pixel.
+
 ---
 
 ## 9. Textura Procedural e Filtros 2D

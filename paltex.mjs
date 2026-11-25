@@ -26,6 +26,7 @@ const S = {
   trace: { active: false, dir: null, scale: 4, pad: 4, all: false, step: 0 },
   includeStack: [], sheetOut: null, json: false, strict: false,
   vars: new Map(), strVars: new Map(), macros: new Map(),
+  mat: new Uint8Array(0), materials: new Map(), matById: [null], activeMatWrite: 0,
 };
 const out = (s = '') => process.stdout.write(s + '\n');
 process.stdout.on('error', (e) => { if (e.code !== 'EPIPE') throw e; }); // "| head" must not kill the script (it may still have to save)
@@ -521,8 +522,44 @@ function blendHeightBuf(dst, src, pxMask, hmode, smoothR) {
 }
 const activeHMap = () => (S.layers.length ? S.layers[S.activeLayer].hmap : S.hmap);
 const markHChanged = () => { S.hchanged++; if (S.layers.length) S.layers[S.activeLayer].hused = true; };
+function ensureMaterial(name, opts = {}) {
+  if (!name || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) fail(`bad material name "${name}"`);
+  let m = S.materials.get(name);
+  if (!m) {
+    if (S.matById.length >= 256) fail('max 255 materials supported');
+    m = { id: S.matById.length, name, ramp: null, spec: null, gloss: null, shadow_ramp: null, shadow_mix: null, hi_ramp: null, hi_mix: null };
+    S.materials.set(name, m);
+    S.matById.push(m);
+  }
+  if (opts.ramp !== undefined) {
+    if (!S.ramps.has(opts.ramp)) fail(`material "${name}": unknown ramp "${opts.ramp}"`);
+    m.ramp = opts.ramp;
+  }
+  if (opts.spec !== undefined) m.spec = fnum(opts.spec, 0, 'spec');
+  if (opts.gloss !== undefined) m.gloss = fnum(opts.gloss, 16, 'gloss');
+  if (opts.shadow_ramp !== undefined) m.shadow_ramp = opts.shadow_ramp;
+  if (opts.shadow_mix !== undefined) m.shadow_mix = opts.shadow_mix;
+  if (opts.hi_ramp !== undefined || opts.light_ramp !== undefined) m.hi_ramp = opts.hi_ramp ?? opts.light_ramp;
+  if (opts.hi_mix !== undefined || opts.light_mix !== undefined) m.hi_mix = opts.hi_mix ?? opts.light_mix;
+  return m;
+}
+function matMaskSet(expr) {
+  let s = String(expr).trim();
+  const inv = s.startsWith('!');
+  if (inv) s = s.slice(1);
+  const outSet = new Uint8Array(256);
+  for (const tok of s.split(',')) {
+    const t = tok.trim();
+    if (!t) continue;
+    if (t === 'none' || t === '0') { outSet[0] = 1; continue; }
+    const m = S.materials.get(t) || fail(`unknown material "${t}" (define with: material ${t} ...)`);
+    outSet[m.id] = 1;
+  }
+  if (inv) for (let i = 0; i < 256; i++) outSet[i] ^= 1;
+  return outSet;
+}
 function initCanvas(w, h, fillIdx = 0) {
-  S.w = w; S.h = h; S.px = new Uint8Array(w * h).fill(fillIdx); S.hmap = new Float32Array(w * h);
+  S.w = w; S.h = h; S.px = new Uint8Array(w * h).fill(fillIdx); S.hmap = new Float32Array(w * h); S.mat = new Uint8Array(w * h);
   S.layers = []; S.activeLayer = -1; S.belowPx = null; S.anchors.clear(); S.shapes.clear(); S.activeShape = null;
   S.albedo = null; S.albedoLayer = -1; S.lightAccum = null; S.lastLights = [];
   S.undoStack = []; S.undoBytes = 0; S.checkpoints.clear(); S.lastDiff = null;
@@ -552,24 +589,38 @@ function compositeHeight() {
     blendHeightBuf(S.hmap, L.hmap, L.kind === 'paint' ? L.px : null, L.hmode || 'add', L.smoothR || 2.5);
   }
 }
+function compositeMat() {
+  if (!S.layers.length) return;
+  if (S.layers[0].mat) S.mat.set(S.layers[0].mat);
+  for (let li = 1; li < S.layers.length; li++) {
+    const L = S.layers[li];
+    if (!L.visible || !L.mat) continue;
+    if (L.kind === 'paint') {
+      for (let i = 0; i < S.mat.length; i++) if (L.px[i] >= 0 && L.mat[i] > 0) S.mat[i] = L.mat[i];
+    } else if (L.kind === 'base') {
+      S.mat.set(L.mat);
+    }
+  }
+}
 function syncLayers() {
   if (!S.layers.length) { S.belowPx = null; return; }
   S.belowPx = S.activeLayer > 0 ? compositeLayers(S.activeLayer - 1) : null;
   compositeLayers(S.layers.length - 1, S.px);
   compositeHeight();
+  compositeMat();
 }
 function snapState(label = '') {
   return {
-    label, w: S.w, h: S.h, px: S.px.slice(), hmap: S.hmap.slice(),
+    label, w: S.w, h: S.h, px: S.px.slice(), hmap: S.hmap.slice(), mat: S.mat.slice(),
     albedo: S.albedo ? S.albedo.slice() : null, albedoLayer: S.albedoLayer,
-    activeLayer: S.activeLayer, layers: S.layers.map((l) => ({ ...l, px: l.px.slice(), hmap: l.hmap ? l.hmap.slice() : new Float32Array(S.w * S.h) })),
+    activeLayer: S.activeLayer, layers: S.layers.map((l) => ({ ...l, px: l.px.slice(), hmap: l.hmap ? l.hmap.slice() : new Float32Array(S.w * S.h), mat: l.mat ? l.mat.slice() : new Uint8Array(S.w * S.h) })),
     activeShape: S.activeShape, shapes: [...S.shapes].map(([k, v]) => [k, v.slice()]),
   };
 }
 function restoreState(st) {
-  S.w = st.w; S.h = st.h; S.px = st.px.slice(); S.hmap = st.hmap.slice();
+  S.w = st.w; S.h = st.h; S.px = st.px.slice(); S.hmap = st.hmap.slice(); S.mat = st.mat ? st.mat.slice() : new Uint8Array(st.w * st.h);
   S.albedo = st.albedo ? st.albedo.slice() : null; S.albedoLayer = st.albedoLayer ?? -1;
-  S.activeLayer = st.activeLayer; S.layers = st.layers.map((l) => ({ ...l, px: l.px.slice(), hmap: l.hmap ? l.hmap.slice() : new Float32Array(S.w * S.h) }));
+  S.activeLayer = st.activeLayer; S.layers = st.layers.map((l) => ({ ...l, px: l.px.slice(), hmap: l.hmap ? l.hmap.slice() : new Float32Array(S.w * S.h), mat: l.mat ? l.mat.slice() : new Uint8Array(S.w * S.h) }));
   S.shapes = new Map((st.shapes || []).map(([k, v]) => [k, v.slice()])); S.activeShape = st.activeShape ?? null;
   syncLayers(); S.changed++;
 }
@@ -589,6 +640,14 @@ const get = (x, y, src = S.px) => {
 function put(x, y, c) {
   if (S.wrap) { x = mod(x, S.w); y = mod(y, S.h); } else if (x < 0 || y < 0 || x >= S.w || y >= S.h) return;
   const i = y * S.w + x;
+  if (S.activeMatWrite > 0) {
+    if (S.layers.length) {
+      const L = S.layers[S.activeLayer];
+      if (!L.mat) L.mat = new Uint8Array(S.w * S.h);
+      L.mat[i] = S.activeMatWrite;
+    }
+    S.mat[i] = S.activeMatWrite;
+  }
   if (!S.layers.length) {
     if (S.px[i] !== c) { S.px[i] = c; S.changed++; }
     return;
@@ -711,14 +770,16 @@ function evalShapeExpr(expr) {
 function scope(o, srcOverride = null) {
   const src = srcOverride || S.px.slice(), R = o.region, M = o.mask;
   const SB = o.shape && o.shape !== 'radial' && o.shape !== 'linear' ? evalShapeExpr(o.shape) : null;
+  const MM = (o.mat && !o._matWrite) ? matMaskSet(o.mat) : null;
   const inS = (x, y) => !SB || (S.wrap ? SB[mod(y, S.h) * S.w + mod(x, S.w)] === 1 : x >= 0 && y >= 0 && x < S.w && y < S.h && SB[y * S.w + x] === 1);
+  const inM = (x, y) => !MM || (S.wrap ? MM[S.mat[mod(y, S.h) * S.w + mod(x, S.w)]] === 1 : x >= 0 && y >= 0 && x < S.w && y < S.h && MM[S.mat[y * S.w + x]] === 1);
   const inR = (x, y) => !R || (S.wrap ? mod(x - R[0], S.w) < R[2] && mod(y - R[1], S.h) < R[3] : x >= R[0] && y >= R[1] && x < R[0] + R[2] && y < R[1] + R[3]);
-  const has = (x, y) => { const c = get(x, y, src); return c >= 0 && inR(x, y) && inS(x, y) && (!M || M[c] === 1); };
+  const has = (x, y) => { const c = get(x, y, src); return c >= 0 && inR(x, y) && inS(x, y) && inM(x, y) && (!M || M[c] === 1); };
   const each = (fn) => {
     const [x0, y0, w, h] = regionOf(o);
     for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) {
       const x = x0 + i, y = y0 + j, c = get(x, y, src);
-      if (c >= 0 && inS(x, y) && (!M || M[c] === 1)) fn(x, y, c, i, j);
+      if (c >= 0 && inS(x, y) && inM(x, y) && (!M || M[c] === 1)) fn(x, y, c, i, j);
     }
   };
   return { src, inR, has, each };
@@ -1777,8 +1838,9 @@ function resize(w, h) { // nearest-neighbour (syncs px, hmap, and layers)
   };
   S.px = mapBuf(S.px, Uint8Array);
   S.hmap = mapBuf(S.hmap, Float32Array);
+  S.mat = mapBuf(S.mat, Uint8Array);
   if (S.albedo) S.albedo = mapBuf(S.albedo, Uint8Array);
-  for (const L of S.layers) { L.px = mapBuf(L.px, L.kind === 'base' ? Uint8Array : Int16Array); if (L.hmap) L.hmap = mapBuf(L.hmap, Float32Array); }
+  for (const L of S.layers) { L.px = mapBuf(L.px, L.kind === 'base' ? Uint8Array : Int16Array); if (L.hmap) L.hmap = mapBuf(L.hmap, Float32Array); if (L.mat) L.mat = mapBuf(L.mat, Uint8Array); }
   for (const [k, sb] of S.shapes) S.shapes.set(k, mapBuf(sb, Uint8Array));
   S.w = w; S.h = h; syncLayers(); S.changed++;
 }
@@ -1821,8 +1883,9 @@ function shift(dx, dy) { // scroll with wrap — move the seams to the middle to
   };
   S.px = mapBuf(S.px, Uint8Array);
   S.hmap = mapBuf(S.hmap, Float32Array);
+  S.mat = mapBuf(S.mat, Uint8Array);
   if (S.albedo) S.albedo = mapBuf(S.albedo, Uint8Array);
-  for (const L of S.layers) { L.px = mapBuf(L.px, L.kind === 'base' ? Uint8Array : Int16Array); if (L.hmap) L.hmap = mapBuf(L.hmap, Float32Array); }
+  for (const L of S.layers) { L.px = mapBuf(L.px, L.kind === 'base' ? Uint8Array : Int16Array); if (L.hmap) L.hmap = mapBuf(L.hmap, Float32Array); if (L.mat) L.mat = mapBuf(L.mat, Uint8Array); }
   for (const [k, sb] of S.shapes) S.shapes.set(k, mapBuf(sb, Uint8Array));
   syncLayers(); S.changed++;
 }
@@ -1835,8 +1898,9 @@ function flip(axis) {
   };
   S.px = mapBuf(S.px, Uint8Array);
   S.hmap = mapBuf(S.hmap, Float32Array);
+  S.mat = mapBuf(S.mat, Uint8Array);
   if (S.albedo) S.albedo = mapBuf(S.albedo, Uint8Array);
-  for (const L of S.layers) { L.px = mapBuf(L.px, L.kind === 'base' ? Uint8Array : Int16Array); if (L.hmap) L.hmap = mapBuf(L.hmap, Float32Array); }
+  for (const L of S.layers) { L.px = mapBuf(L.px, L.kind === 'base' ? Uint8Array : Int16Array); if (L.hmap) L.hmap = mapBuf(L.hmap, Float32Array); if (L.mat) L.mat = mapBuf(L.mat, Uint8Array); }
   for (const [k, sb] of S.shapes) S.shapes.set(k, mapBuf(sb, Uint8Array));
   syncLayers(); S.changed++;
 }
@@ -2222,7 +2286,9 @@ function masonryCmd(rampName, o, isPlates = false) {
   const r = S.ramps.get(rampName) || fail(`masonry: unknown ramp "${rampName}"`);
   const style = o.style || (isPlates ? 'grid' : 'running');
   if (!['running', 'grid', 'ashlar'].includes(style)) fail('masonry style must be running | grid | ashlar');
-  const sc = scope(o), [rx0, ry0, rw, rh] = regionOf(o);
+  // scope must NOT filter by mat= here — mat= and mortar_mat= are write-IDs, not read filters
+  const { mat: _m, mortar_mat: _mm, ...scopeO } = o;
+  const sc = scope(scopeO), [rx0, ry0, rw, rh] = regionOf(o);
   const cols = o.cols ? clamp(num(o.cols, 4, 'cols'), 1, 64) : Math.max(1, Math.round(rw / Math.max(4, num(o.w, 32, 'w'))));
   const rows = o.rows ? clamp(num(o.rows, 4, 'rows'), 1, 64) : Math.max(1, Math.round(rh / Math.max(4, num(o.h, 16, 'h'))));
   const mortar = clamp(num(o.mortar, isPlates ? 1 : 2, 'mortar'), 0, 8);
@@ -2263,8 +2329,12 @@ function masonryCmd(rampName, o, isPlates = false) {
     const dDiag = (dxEdge + dyEdge) * 0.72 - bite;
     const dEdge = Math.min(dxEdge, dyEdge, dDiag);
     const mLocal = roughAmt > 0 ? mortar * (0.75 + 0.5 * (wxField[hi])) : mortar;
+    const brickMatId = o.mat ? ensureMaterial(o.mat).id : 0;
+    const mortarMatId = o.mortar_mat ? ensureMaterial(o.mortar_mat).id : 0;
     if (dEdge < mLocal) {
+      S.activeMatWrite = mortarMatId;
       put(x, y, mortarCol);
+      S.activeMatWrite = 0;
       HBUF[hi] = -Math.max(1, blkH * 0.4); markHChanged();
       return;
     }
@@ -2282,7 +2352,9 @@ function masonryCmd(rampName, o, isPlates = false) {
       const ryD = Math.min(Math.abs(ly - (y0 + mortar + 2)), Math.abs(ly - (y1 - mortar - 3)));
       if (rxD <= 0.6 && ryD <= 0.6) { c = rivetCol; HBUF[hi] += 1.5; }
     }
+    S.activeMatWrite = brickMatId;
     put(x, y, c);
+    S.activeMatWrite = 0;
   });
   syncLayers();
 }
@@ -2477,8 +2549,33 @@ function lightHeight(o, record = true) {
   const hl = Math.hypot(Lx, Ly, Lz + 1) || 1, Hx = Lx / hl, Hy = Ly / hl, Hz = (Lz + 1) / hl;
   const aoKernel = aoAmt > 0 ? radialOffs(aoRad) : null;
   const hSrc = S.hmap, sc = scope(o, accum ? S.lightAccum.albedo : null), Q = quantizer(D, regionOf(o)[2]), tanEl = Math.tan(el);
+  const matCache = new Map();
+  const getMatProps = (matId) => {
+    if (!matId) return null;
+    if (matCache.has(matId)) return matCache.get(matId);
+    const m = S.matById[matId];
+    if (!m) { matCache.set(matId, null); return null; }
+    const p = {
+      spec: m.spec ?? specAmt,
+      gloss: m.gloss ?? gloss,
+      ramp: targetRamp || (m.ramp ? S.ramps.get(m.ramp) : null),
+      shSpec: shSpec || (m.shadow_ramp ? parseRampMix(m.shadow_ramp, m.shadow_mix, 45) : null),
+      hiSpec: hiSpec || (m.hi_ramp ? parseRampMix(m.hi_ramp, m.hi_mix, 40) : null),
+    };
+    if (accum) {
+      if (m.ramp) S.lightAccum.allowedRamps.add(m.ramp);
+      if (p.shSpec) S.lightAccum.allowedRamps.add(p.shSpec.name);
+      if (p.hiSpec) S.lightAccum.allowedRamps.add(p.hiSpec.name);
+    }
+    matCache.set(matId, p);
+    return p;
+  };
   sc.each((x, y, c, i, j) => {
     if (S.fullbright[c]) return;
+    const idxM = mod(y, S.h) * S.w + mod(x, S.w);
+    const mp = getMatProps(S.mat[idxM]);
+    const pxSpec = mp ? mp.spec : specAmt, pxGloss = mp ? mp.gloss : gloss;
+    const pxRamp = mp ? mp.ramp : targetRamp, pxSh = mp ? mp.shSpec : shSpec, pxHi = mp ? mp.hiSpec : hiSpec;
     const [gx, gy] = sobelGradient(hSrc, x, y);
     let nx = -gx * zscale, ny = -gy * zscale, nz = 1;
     const nl = Math.hypot(nx, ny, nz) || 1;
@@ -2493,19 +2590,19 @@ function lightHeight(o, record = true) {
     }
     let sf;
     const minNdotl = -Math.cos(el);
-    if (targetRamp) {
+    if (pxRamp) {
       const t = clamp((ndotl * litFactor - minNdotl) / Math.max(0.1, 1 - minNdotl), 0, 1);
       const tgtStep = lo + (hi - lo) * t;
-      const curStep = S.rampOf[c] ? S.rampOf[c].i : Math.round(brightnessOf(c) * (targetRamp.length - 1));
+      const curStep = S.rampOf[c] ? S.rampOf[c].i : Math.round(brightnessOf(c) * (pxRamp.length - 1));
       sf = accum ? (tgtStep - curStep) : tgtStep;
     } else {
       sf = ndotl >= Lz ? ((ndotl - Lz) / Math.max(0.05, 1 - Lz)) * hi : ((ndotl - Lz) / Math.max(0.15, Lz - minNdotl)) * (-lo);
       if (litFactor < 1 && sf > 0) sf *= litFactor;
       if (litFactor < 1 && sf <= 0) sf = Math.min(sf, lo * 0.5);
     }
-    if (specAmt > 0 && litFactor > 0.5) {
+    if (pxSpec > 0 && litFactor > 0.5) {
       const ndoth = Math.max(0, nx * Hx + ny * Hy + nz * Hz);
-      sf += Math.pow(ndoth, gloss) * specAmt;
+      sf += Math.pow(ndoth, pxGloss) * pxSpec;
     }
     if (aoAmt > 0) {
       const diff = localMeanDiff(hSrc, x, y, aoKernel);
@@ -2523,17 +2620,24 @@ function lightHeight(o, record = true) {
         const colRgb = S.pal[spec.ramp[clamp(Math.round(b * (spec.ramp.length - 1)), 0, spec.ramp.length - 1)]];
         A.tintR[idx] += colRgb[0] * w; A.tintG[idx] += colRgb[1] * w; A.tintB[idx] += colRgb[2] * w; A.tintW[idx] += w;
       };
-      if (targetRamp) addTint({ ramp: targetRamp, mix: 1 }, 1);
-      if (shSpec && sf < 0) addTint(shSpec, shSpec.mix * (0.65 + 0.35 * clamp(Math.abs(sf) / 4, 0, 1)));
-      if (hiSpec && sf > 0) addTint(hiSpec, hiSpec.mix * (0.65 + 0.35 * clamp(sf / 4, 0, 1)));
+      if (pxRamp) addTint({ ramp: pxRamp, mix: 1 }, 1);
+      if (pxSh && sf < 0) addTint(pxSh, pxSh.mix * (0.65 + 0.35 * clamp(Math.abs(sf) / 4, 0, 1)));
+      if (pxHi && sf > 0) addTint(pxHi, pxHi.mix * (0.65 + 0.35 * clamp(sf / 4, 0, 1)));
       if (rimSpec && rimSf > 0.05) addTint(rimSpec, rimSpec.mix * rimF);
       return;
     }
     const q = Q(sf + rimSf, x, y, i, j);
-    if (targetRamp) { put(x, y, targetRamp[clamp(q, 0, targetRamp.length - 1)]); return; }
+    if (pxRamp && !accum) {
+      let outCol = pxRamp[clamp(q, 0, pxRamp.length - 1)];
+      if (pxSh && sf < -0.25) outCol = mixColorTowardRamp(c, outCol, pxSh, pxSh.mix * (0.65 + 0.35 * clamp(Math.abs(sf) / 4, 0, 1)));
+      else if (pxHi && sf > 0.25) outCol = mixColorTowardRamp(c, outCol, pxHi, pxHi.mix * (0.65 + 0.35 * clamp(sf / 4, 0, 1)));
+      if (rimSpec && rimSf > 0.25) outCol = mixColorTowardRamp(c, outCol, rimSpec, rimSpec.mix * rimF);
+      put(x, y, outCol);
+      return;
+    }
     let outCol = q !== 0 ? shadeIdx(c, q) : c;
-    if (shSpec && sf < -0.25) outCol = mixColorTowardRamp(c, outCol, shSpec, shSpec.mix * (0.65 + 0.35 * clamp(Math.abs(sf) / 4, 0, 1)));
-    else if (hiSpec && sf > 0.25) outCol = mixColorTowardRamp(c, outCol, hiSpec, hiSpec.mix * (0.65 + 0.35 * clamp(sf / 4, 0, 1)));
+    if (pxSh && sf < -0.25) outCol = mixColorTowardRamp(c, outCol, pxSh, pxSh.mix * (0.65 + 0.35 * clamp(Math.abs(sf) / 4, 0, 1)));
+    else if (pxHi && sf > 0.25) outCol = mixColorTowardRamp(c, outCol, pxHi, pxHi.mix * (0.65 + 0.35 * clamp(sf / 4, 0, 1)));
     if (rimSpec && rimSf > 0.25) outCol = mixColorTowardRamp(c, outCol, rimSpec, rimSpec.mix * rimF);
     if (outCol !== c) put(x, y, outCol);
   });
@@ -3177,9 +3281,10 @@ function savePtxs(file) {
       rows: sp.rows, meta: sp.meta ? { ...sp.meta, overrides: sp.meta.overrides ? [...sp.meta.overrides.entries()] : [] } : null,
     }]),
     hasAlbedo: !!S.albedo,
+    materials: S.matById.slice(1),
     layers: S.layers.map((l) => ({
       name: l.name, kind: l.kind, visible: l.visible, hused: l.hused,
-      hmode: l.hmode, smoothR: l.smoothR, pxType: l.px.constructor.name,
+      hmode: l.hmode, smoothR: l.smoothR, pxType: l.px.constructor.name, hasMat: !!l.mat,
     })),
     shapes: [...S.shapes.entries()].map(([k, v]) => [k, v.length]),
   };
@@ -3190,8 +3295,9 @@ function savePtxs(file) {
   const pushArr = (arr) => parts.push(Buffer.from(arr.buffer, arr.byteOffset, arr.byteLength));
   pushArr(S.px);
   pushArr(S.hmap);
+  pushArr(S.mat);
   if (S.albedo) pushArr(S.albedo);
-  for (const l of S.layers) { pushArr(l.px); pushArr(l.hmap); }
+  for (const l of S.layers) { pushArr(l.px); pushArr(l.hmap); if (l.mat) pushArr(l.mat); }
   for (const [, buf] of S.shapes) pushArr(buf);
   const body = zlib.deflateSync(Buffer.concat(parts), { level: 6 });
   fs.writeFileSync(file, Buffer.concat([Buffer.from('PTXS\x01', 'latin1'), body]));
@@ -3235,10 +3341,16 @@ function loadPtxs(file) {
   const nPx = S.w * S.h;
   S.px = takeArr(Uint8Array, nPx);
   S.hmap = takeArr(Float32Array, nPx);
+  S.mat = meta.materials ? takeArr(Uint8Array, nPx) : new Uint8Array(nPx);
+  S.materials = new Map(); S.matById = [null];
+  for (const m of (meta.materials || [])) {
+    S.materials.set(m.name, { ...m });
+    S.matById[m.id] = S.materials.get(m.name);
+  }
   S.albedo = meta.hasAlbedo ? takeArr(Uint8Array, nPx) : null;
   S.layers = (meta.layers || []).map((l) => {
     const Ctor = TYPED_ARRAYS[l.pxType] || Uint8Array;
-    return { name: l.name, kind: l.kind, visible: l.visible, hused: l.hused, hmode: l.hmode, smoothR: l.smoothR, px: takeArr(Ctor, nPx), hmap: takeArr(Float32Array, nPx) };
+    return { name: l.name, kind: l.kind, visible: l.visible, hused: l.hused, hmode: l.hmode, smoothR: l.smoothR, px: takeArr(Ctor, nPx), hmap: takeArr(Float32Array, nPx), mat: l.hasMat ? takeArr(Uint8Array, nPx) : new Uint8Array(nPx) };
   });
   S.shapes = new Map((meta.shapes || []).map(([k, len]) => [k, takeArr(Uint8Array, len)]));
   syncLayers();
@@ -3285,7 +3397,9 @@ function probeCmd(x, y) {
     }
     layerInfo = ` layer=${topLayer}`;
   }
-  out(`probe ${wx},${wy}: idx=${c} ${hex(rgb)} rgb(${rgb.join(',')}) luma=${lum.toFixed(2)} ramp=${rm ? `${rm.name}:${rm.i}/${rm.len - 1}` : '-'}${S.fullbright[c] ? ' [FB]' : ''} h=${h.toFixed(2)}${layerInfo}${inShapes.length ? ` shapes=[${inShapes.join(',')}]` : ''}`);
+  const matObj = S.mat[idx] ? S.matById[S.mat[idx]] : null;
+  const matInfo = matObj ? ` mat=${matObj.name}` : '';
+  out(`probe ${wx},${wy}: idx=${c} ${hex(rgb)} rgb(${rgb.join(',')}) luma=${lum.toFixed(2)} ramp=${rm ? `${rm.name}:${rm.i}/${rm.len - 1}` : '-'}${S.fullbright[c] ? ' [FB]' : ''} h=${h.toFixed(2)}${matInfo}${layerInfo}${inShapes.length ? ` shapes=[${inShapes.join(',')}]` : ''}`);
 }
 const FONT3X5 = {
   '0': [7,5,5,5,7], '1': [2,6,2,2,7], '2': [7,1,7,4,7], '3': [7,1,7,1,7], '4': [5,5,7,1,1],
@@ -3700,7 +3814,7 @@ def('layer', 'new [name] [shade] [hmode=add|max|over|smin] [k=2.5] | hmode <add|
   const sub = a[0] || 'list';
   const ensureBase = () => {
     if (!S.layers.length) {
-      S.layers.push({ name: 'base', kind: 'base', px: S.px.slice(), hmap: S.hmap.slice(), hused: S.hchanged > 0, hmode: 'replace', smoothR: 2.5, visible: true });
+      S.layers.push({ name: 'base', kind: 'base', px: S.px.slice(), hmap: S.hmap.slice(), mat: S.mat.slice(), hused: S.hchanged > 0, hmode: 'replace', smoothR: 2.5, visible: true });
       S.activeLayer = 0;
     }
   };
@@ -3712,7 +3826,7 @@ def('layer', 'new [name] [shade] [hmode=add|max|over|smin] [k=2.5] | hmode <add|
     if (!['add', 'max', 'over', 'smin'].includes(hm)) fail('layer hmode must be add | max | over | smin');
     const sr = fnum(o.k ?? o.smooth, 2.5, 'k');
     const px = isShade ? new Int16Array(S.w * S.h) : new Int16Array(S.w * S.h).fill(-1);
-    S.layers.push({ name: nm, kind: isShade ? 'shade' : 'paint', px, hmap: new Float32Array(S.w * S.h), hused: false, hmode: hm, smoothR: sr, visible: true });
+    S.layers.push({ name: nm, kind: isShade ? 'shade' : 'paint', px, hmap: new Float32Array(S.w * S.h), mat: new Uint8Array(S.w * S.h), hused: false, hmode: hm, smoothR: sr, visible: true });
     S.activeLayer = S.layers.length - 1;
     syncLayers();
     out(`layer: created "${nm}" (${isShade ? 'shade' : 'paint'}, hmode=${hm}, #${S.activeLayer})`);
@@ -3992,6 +4106,38 @@ def('scatter_along', '<sp1,sp2,...> <curve|spline|line> <p1 p2 ...> [count=N] [s
   'Scatter sprites randomly from a list along a line, curve, or spline.', (a, o) => {
   needCanvas(); stampAlongCmd(a, o, true);
 }, true, ['closed', 'flipx', 'flipy', 'center']);
+def('material', '<name> [ramp=…] [spec=N] [gloss=N] [shadow_ramp=…] [hi_ramp=…] | fill <name> [mask=…] [shape=…] [region=…] | list',
+  'Define per-pixel material properties (used automatically by light) or tag pixels in S.mat.', (a, o) => {
+  const sub = need(a[0], 'name|fill|list');
+  if (sub === 'list') {
+    if (!S.materials.size) return out('materials: (none)');
+    for (const m of S.materials.values()) {
+      out(`  [${m.id}] ${m.name}${m.ramp ? ` ramp=${m.ramp}` : ''}${m.spec !== null ? ` spec=${m.spec}` : ''}${m.gloss !== null ? ` gloss=${m.gloss}` : ''}${m.shadow_ramp ? ` shadow_ramp=${m.shadow_ramp}` : ''}${m.hi_ramp ? ` hi_ramp=${m.hi_ramp}` : ''}`);
+    }
+    return;
+  }
+  if (sub === 'fill') {
+    needCanvas();
+    const nm = need(a[1], 'material');
+    const m = ensureMaterial(nm);
+    const sc = scope(o);
+    let cnt = 0;
+    sc.each((x, y) => {
+      const i = mod(y, S.h) * S.w + mod(x, S.w);
+      S.mat[i] = m.id;
+      if (S.layers.length) {
+        const L = S.layers[S.activeLayer];
+        if (!L.mat) L.mat = new Uint8Array(S.w * S.h);
+        L.mat[i] = m.id;
+      }
+      cnt++;
+    });
+    out(`material fill "${m.name}" (#${m.id}): ${cnt} px`);
+    return;
+  }
+  const m = ensureMaterial(sub, o);
+  out(`material "${m.name}" (#${m.id}) defined`);
+});
 def('strict', 'on | off', 'Treat any warning (unknown option, 0 pixels changed, 0 height samples) as a fatal error.', (a) => {
   const v = need(a[0], 'on|off');
   if (v !== 'on' && v !== 'off') fail('strict on | strict off');
@@ -4062,7 +4208,7 @@ def('save', '<file.png> [scale=N] [tile=N]', 'Write an indexed 8-bit PNG (palett
 });
 
 // ─────────────────────────────────────────────────────────────── option parser, script runner, CLI
-const KNOWN = new Set('against all alpha amount angle angle_jitter ao ao_radius aspect axis bayer bevel bg bias bleed blend branch breakup bristles brush center chip clump cols color contrast count cross density depth dir dither elev face fill flow flow_jitter follow from gloss h height hi hi_mix hi_ramp hmode in jitter jump k keep len light light_mix light_ramp lip lo mask mid min mode mortar mortar_color n noise normal octaves opacity outline overlay pad passes prob profile protect radial radius ramp ramps range region repeat reset ridge rim rim_elev rim_mix rim_ramp rim_strength rivets rot rough round rows scale scalex scaley scatter seed shade shade_jitter shadow shadow_mix shadow_ramp shape sharp side size size_jitter skip smooth soft spacing spec spread step strength style sym taper tex_scale thresh tile tilt tint to type vary view w warp width wobble'.split(' '));
+const KNOWN = new Set('against all alpha amount angle angle_jitter ao ao_radius aspect axis bayer bevel bg bias bleed blend branch breakup bristles brush center chip clump cols color contrast count cross density depth dir dither elev face fill flow flow_jitter follow from gloss h height hi hi_mix hi_ramp hmode in jitter jump k keep len light light_mix light_ramp lip lo mask mat mid min mode mortar mortar_color mortar_mat n noise normal octaves opacity outline overlay pad passes prob profile protect radial radius ramp ramps range region repeat reset ridge rim rim_elev rim_mix rim_ramp rim_strength rivets rot rough round rows scale scalex scaley scatter seed shade shade_jitter shadow shadow_mix shadow_ramp shape sharp side size size_jitter skip smooth soft spacing spec spread step strength style sym taper tex_scale thresh tile tilt tint to type vary view w warp width wobble'.split(' '));
 const parseRegion = (v) => {
   const s = String(v);
   if (s.startsWith('anchor:')) {
@@ -4388,7 +4534,13 @@ function runScript(text, label = 'script', nested = false) {
             S.sym.ax = ax; S.sym.ay = ay;
           }
         }
-        try { cmd.fn(a, o); } finally { if (prevSym) S.sym = prevSym; }
+        const MAT_WRITE_CMDS = new Set(['fill', 'pixel', 'line', 'rect', 'poly', 'ellipse', 'flood', 'stroke', 'curve', 'spline', 'stamp', 'stamp_along', 'scatter_along', 'shape', 'import']);
+        const prevMatW = S.activeMatWrite;
+        if (o.mat && MAT_WRITE_CMDS.has(name) && !/[!,]/.test(String(o.mat))) {
+          o._matWrite = true;
+          S.activeMatWrite = ensureMaterial(o.mat).id;
+        }
+        try { cmd.fn(a, o); } finally { S.activeMatWrite = prevMatW; if (prevSym) S.sym = prevSym; }
         nCmd++;
         if (beforePx) {
           S.lastDiff = { px: beforePx, cmd: toks.join(' ').slice(0, 60) };
