@@ -218,10 +218,13 @@ O canal de altura (`S.hmap`) armazena relevo contínuo paralelo ao canvas de ín
 
 | Subcomando | Descrição |
 | --- | --- |
-| `height inflate [mask=] [region=] [radius=N] [amount=6] [profile=round\|dome\|smooth\|linear] [mode=add\|max\|set]` | Calcula a Transformada de Distância Euclidiana até a borda da máscara e cria volume arredondado ("almofada"). Se `radius=` for omitido, usa a distância máxima interna da forma. |
-| `height bevel [mask=] [region=] [depth=4] [amount=6] [profile=linear\|round\|dome\|smooth] [mode=add\|max\|set]` | Sobe por `depth` pixels a partir da borda e mantém um platô plano no topo (ideal para chapas e molduras). |
-| `height stroke\|curve\|spline <val> <x,y>... [size=3] [taper=] [soft] [ridge] [closed] [mode=add\|max\|set]` | Esculpe sulcos negativos (`-4`) ou cristas positivas (`+5`, `ridge`) diretamente no canal de altura (com suporte a `sym`). |
-| `height rect\|ellipse\|poly` / `height grad <x0> <y0> <x1> <y1> [from=0 to=4] [shape=linear\|radial]` | Desenha formas geométricas ou planos inclinados diretamente em `S.hmap`. |
+| `height inflate [mask=] [region=] [radius=N] [amount=6] [profile=round\|dome\|smooth\|linear] [mode=add\|max\|set\|smin] [k=3]` | Calcula a Transformada de Distância Euclidiana até a borda da máscara e cria volume arredondado (`mode=smin k=3` faz união orgânica suave sem vincos). |
+| `height bevel [mask=] [region=] [depth=4] [amount=6] [profile=linear\|round\|dome\|smooth] [mode=add\|max\|set\|smin]` | Sobe por `depth` pixels a partir da borda e mantém um platô plano no topo (ideal para chapas e molduras). |
+| `height stroke\|curve\|spline <val> <x,y>... [size=3] [taper=] [soft] [ridge] [closed] [mode=add\|max\|set\|smin]` | Esculpe sulcos negativos (`-4`) ou cristas positivas (`+5`, `ridge`) diretamente no canal de altura (com suporte a `sym`). |
+| `height ribs <val> <x,y> <x,y> ... [count=8] [depth=2] [size=6] [taper=100,35] [sharp=50] [color=<c>] [hi=<c>] [mode=...]` | Gera gomos/anéis periódicos esculpidos ao longo de uma curva (ideal para chifres, cabos, correntes e vértebras) em 1 linha. |
+| `height crack <x0,y0> <x1,y1> [depth=3] [width=1] [branch=2] [wobble=2.5] [color=<c>] [lip=<+n\|c>] [seed=N]` | Cria fissura ramificada gravando vale no `hmap`, opcionalmente escurecendo a fenda e iluminando a borda (`lip=`). |
+| `height compose <srcLayer> [dstLayer] [mode=smin\|max\|add\|over] [k=3]` | Compõe explicitamente o relevo entre camadas. |
+| `height rect\|ellipse\|poly` / `height grad <x0> <y0> <x1> <y1> [from=0 to=4] [mode=linear\|radial] [radial]` | Desenha formas geométricas ou planos inclinados diretamente no relevo ativo. |
 | `height add <val> [mask=] [region=]` | Soma `val` (pode ser negativo, ex.: `height add -4 mask=socket`). |
 | `height set <val> [mask=] [region=]` | Define altura fixa no escopo. |
 | `height clear [val=0]` | Reseta o canal de altura inteiro. |
@@ -232,10 +235,17 @@ O canal de altura (`S.hmap`) armazena relevo contínuo paralelo ao canvas de ín
 
 Para visualizar o mapa de altura no terminal: `dump view=height` ou `zoom x y w h view=height` (mostra de `0` = mínimo a `z` = máximo).
 
-### Iluminação pelo relevo (`light`)
+### Iluminação pelo relevo (`light`, `albedo`, `relight`)
 ```text
-light height dir=nw elev=40 range=-4..+3 dither=bayer4 spec=2 gloss=16 ao=3 ao_radius=4 shadow=8 mask=bone
+albedo save
+light begin
+  light height dir=nw elev=40 range=-4..+4 shadow_ramp=purple:45% hi_ramp=gold:30% spec=2 ao=3 shadow=8 shape=skull
+  light height dir=se elev=25 range=0..+2 rim=se rim_ramp=teal:60% rim_strength=2 shape=skull
+light end
 ```
+- `shadow_ramp=<ramp[:pct%]>` / `hi_ramp=<ramp[:pct%]>` (`light_ramp=`): deslocamento automático de matiz (*hue-shifting*) em sombras e realces dentro da paleta (também aceito em `cavity`, `bevel` e `grad shade`).
+- `rim=<dir>` / `rim_ramp=<ramp[:pct%]>` / `rim_strength=`: luz de recorte (*rim light*) em arestas rasantes.
+- **`light begin ... light end` + `albedo [save|restore|clear]` + `relight`**: acumula múltiplas fontes de luz em ponto flutuante sobre o albedo sem dupla quantização, e permite reiluminar após ajustes em `S.hmap`.
 - `dir=n|ne|e|se|s|sw|w|nw` e `elev=1..89` (graus acima do horizonte).
 - `range=lo..hi` (ou `from=` / `to=`): deslocamento em degraus relativo ao plano horizontal (`sin(elev)` fica em `0` para não alterar superfícies planas), ou mapeamento absoluto quando `ramp=<nome>` é informado.
 - `strength=100`: escala da inclinação das normais Sobel 3×3.
@@ -245,9 +255,10 @@ light height dir=nw elev=40 range=-4..+3 dither=bayer4 spec=2 gloss=16 ao=3 ao_r
 
 ### Hachura (`hatch`)
 ```text
-hatch mask=bone follow=contour angle=-25 spacing=4 shade=-1 jitter=1
+hatch mask=bone follow=contour in=shadow angle=-25 spacing=4 shade=-1 jitter=1
 ```
 - Aceita uma `<color>` posicional ou `shade=<n>` (padrão `-1`).
+- `in=all | shadow | mid | light`: concentra as hachuras só nas sombras (`<= 0.52`), meios-tons (`0.25..0.72`) ou luzes (`>= 0.55`), mantendo realces limpos.
 - `follow=none | contour | slope`:
   - `none`: linhas paralelas no ângulo `angle=` (padrão `-45`).
   - `contour`: streamlines espaçadas por `spacing=` seguindo as curvas de nível do mapa de altura (ou da distância da borda da máscara se `S.hmap` estiver zerado), rotacionadas por `angle=` (padrão `0`).
@@ -282,8 +293,9 @@ sym off
 - Também pode ser passado inline em um único comando (`sym=x|y|xy|off [axis=...]`) sem alterar o estado global seguinte.
 
 ### Camadas (`layer`)
-- `layer new [nome] [shade]`: cria camada transparente acima da atual (ou uma camada `shade` que acumula deltas `+n/-n` sem destruir os materiais abaixo).
-- `layer merge [mode=replace|shade]`: mescla a camada ativa na camada inferior e a remove. Em `mode=shade`, converte a cor/degrau da camada superior (relativo ao meio da rampa) em deslocamento de degraus sobre a camada de baixo.
+- `layer new [nome] [shade] [hmode=add|max|over|smin] [k=2.5]`: cria camada transparente acima da atual com seu próprio canal de altura opcional (`hmode=smin` une relevos organicamente sem vinco duro).
+- `layer hmode <add|max|over|smin> [k=2.5]`: ajusta ao vivo o modo de composição de altura da camada ativa.
+- `layer merge [mode=replace|shade]`: mescla cor e relevo da camada ativa na camada inferior e a remove. Em `mode=shade`, converte a cor/degrau da camada superior (relativo ao meio da rampa) em deslocamento de degraus sobre a camada de baixo.
 - `layer list`, `layer select <nome|idx>`, `layer vis on|off`, `layer clear`, `layer drop`.
 
 ### Histórico (`checkpoint`, `restore`, `undo`, `diff`)
@@ -320,8 +332,11 @@ sym off
 - `rough mask=<shape> [amount=1..8] [prob=P] [side=both|in|out] [clump=1..32] [seed=N]`
 - `chip mask=<shape> [prob=P] [size=1..3] [face=n] [seed=N]`
 - `smudge [radius=1..8] [strength=%] [dir=x|y|d1|d2|n|s|e|w...] [len=1..32] [passes=1..8] [protect=...] [blend=ramp|nearest ramps=a,b] [round=noise|nearest]`
-- `cavity [mask=] [against=] [radius=1..6] [lo=1..16] [min=%] [dither=...] [seed=N]`
-- `bevel [mask=] [region=] [light=...] [depth=N] [hi=N] [lo=N] [soft]`
+- `cavity [mask=] [against=] [radius=1..6] [lo=1..16] [min=%] [shadow_ramp=<r[:pct%]>] [dither=...] [seed=N]`
+- `bevel [mask=] [region=] [light=...] [depth=N] [hi=N] [lo=N] [shadow_ramp=] [hi_ramp=] [soft]`
+- `drip [color|ramp|shade] [from=cavity|mask|all] [dir=s|n|e|w] [len=6..16] [width=1..3] [density=45] [shade=-3] [tint] [dither=...] [protect=...] [seed=N]` — escorridos orgânicos por gravidade a partir de rebites, juntas ou cavidades.
+- `wash [color|ramp|shade] [radius=3] [strength=65] [dither=...] [mask=] [shape=]` — acumula sujeira, azinhavre ou sombra nas reentrâncias côncavas do `hmap`.
+- `drybrush` / `edgewear [color|ramp|+n] [thresh=0.45] [strength=75] [breakup=45] [light=dir] [hi=+2] [dither=...] [seed=N]` — realce quebrado automático nas cristas convexas do `hmap`.
 - `outline <color> mask=<shape> [side=outer|inner] [diag]`
 - `pixelate <n> [mask=] [region=]`
 - `import <file.png> <x> <y> [w=N h=N] [dither=fs|bayerN|noise] [spread=N] [ramps=a,b]`

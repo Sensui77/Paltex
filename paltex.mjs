@@ -20,6 +20,7 @@ const S = {
   brush: DEFAULT_BRUSH(), brushOn: false, brushStack: [],
   sym: { mode: 'off', ax: null, ay: null, jitter: 0, seed: 0 },
   layers: [], activeLayer: -1, belowPx: null,
+  albedo: null, lightAccum: null, lastLights: [],
   undoStack: [], undoBytes: 0, checkpoints: new Map(), lastDiff: null,
   trace: { active: false, dir: null, scale: 4, pad: 4, all: false, step: 0 },
 };
@@ -357,9 +358,26 @@ function loadPaletteFile(file) { // PNG (PLTE or unique colors), GIMP .gpl, JASC
 
 // ─────────────────────────────────────────────────────────────── canvas, layers, undo & symmetry
 const N4 = [[1, 0], [-1, 0], [0, 1], [0, -1]], N8 = [...N4, [1, 1], [-1, 1], [1, -1], [-1, -1]];
+function sminH(a, b, k) {
+  if (!(k > 0)) return Math.max(a, b);
+  const h = clamp(0.5 + (0.5 * (b - a)) / k, 0, 1);
+  return a + (b - a) * h + k * h * (1 - h);
+}
+function blendHeightBuf(dst, src, pxMask, hmode, smoothR) {
+  for (let i = 0; i < dst.length; i++) {
+    const v = src[i], hasPx = pxMask ? pxMask[i] >= 0 : false;
+    if (hmode === 'add') { if (v !== 0) dst[i] += v; }
+    else if (hmode === 'max') { if (v !== 0 || hasPx) dst[i] = Math.max(dst[i], v); }
+    else if (hmode === 'over') { if (v !== 0 || hasPx) dst[i] = v; }
+    else if (hmode === 'smin') { if (v !== 0) dst[i] = sminH(dst[i], v, smoothR || 2.5); }
+  }
+}
+const activeHMap = () => (S.layers.length ? S.layers[S.activeLayer].hmap : S.hmap);
+const markHChanged = () => { S.hchanged++; if (S.layers.length) S.layers[S.activeLayer].hused = true; };
 function initCanvas(w, h, fillIdx = 0) {
   S.w = w; S.h = h; S.px = new Uint8Array(w * h).fill(fillIdx); S.hmap = new Float32Array(w * h);
   S.layers = []; S.activeLayer = -1; S.belowPx = null; S.anchors.clear(); S.shapes.clear(); S.activeShape = null;
+  S.albedo = null; S.lightAccum = null; S.lastLights = [];
   S.undoStack = []; S.undoBytes = 0; S.checkpoints.clear(); S.lastDiff = null;
 }
 function compositeLayers(upto = S.layers.length - 1, outArr = new Uint8Array(S.w * S.h)) {
@@ -378,21 +396,33 @@ function compositeLayers(upto = S.layers.length - 1, outArr = new Uint8Array(S.w
   }
   return outArr;
 }
+function compositeHeight() {
+  if (!S.layers.length) return;
+  S.hmap.set(S.layers[0].hmap);
+  for (let li = 1; li < S.layers.length; li++) {
+    const L = S.layers[li];
+    if (!L.visible || !L.hused) continue;
+    blendHeightBuf(S.hmap, L.hmap, L.kind === 'paint' ? L.px : null, L.hmode || 'add', L.smoothR || 2.5);
+  }
+}
 function syncLayers() {
   if (!S.layers.length) { S.belowPx = null; return; }
   S.belowPx = S.activeLayer > 0 ? compositeLayers(S.activeLayer - 1) : null;
   compositeLayers(S.layers.length - 1, S.px);
+  compositeHeight();
 }
 function snapState(label = '') {
   return {
     label, w: S.w, h: S.h, px: S.px.slice(), hmap: S.hmap.slice(),
-    activeLayer: S.activeLayer, layers: S.layers.map((l) => ({ ...l, px: l.px.slice() })),
+    albedo: S.albedo ? S.albedo.slice() : null,
+    activeLayer: S.activeLayer, layers: S.layers.map((l) => ({ ...l, px: l.px.slice(), hmap: l.hmap ? l.hmap.slice() : new Float32Array(S.w * S.h) })),
     activeShape: S.activeShape, shapes: [...S.shapes].map(([k, v]) => [k, v.slice()]),
   };
 }
 function restoreState(st) {
   S.w = st.w; S.h = st.h; S.px = st.px.slice(); S.hmap = st.hmap.slice();
-  S.activeLayer = st.activeLayer; S.layers = st.layers.map((l) => ({ ...l, px: l.px.slice() }));
+  S.albedo = st.albedo ? st.albedo.slice() : null;
+  S.activeLayer = st.activeLayer; S.layers = st.layers.map((l) => ({ ...l, px: l.px.slice(), hmap: l.hmap ? l.hmap.slice() : new Float32Array(S.w * S.h) }));
   S.shapes = new Map((st.shapes || []).map(([k, v]) => [k, v.slice()])); S.activeShape = st.activeShape ?? null;
   syncLayers(); S.changed++;
 }
@@ -430,6 +460,37 @@ function put(x, y, c) {
       const bc = S.belowPx[i]; S.px[i] = d && !S.fullbright[bc] ? shadeIdx(bc, d) : bc;
     }
   }
+}
+function parseRampMix(spec, mixOpt, dfltPct = 50) {
+  if (spec === undefined) return null;
+  const [name, pctStr] = String(spec).split(':');
+  const r = S.ramps.get(name) || fail(`unknown ramp "${name}" (ramps: ${[...S.ramps.keys()].join(' ')})`);
+  let pct = dfltPct;
+  if (pctStr !== undefined) pct = parseFloat(pctStr);
+  else if (mixOpt !== undefined) pct = fnum(mixOpt, dfltPct, 'mix');
+  if (Number.isNaN(pct)) fail(`bad mix percentage "${spec}"`);
+  return { name, ramp: r, mix: clamp(pct, 0, 100) / 100 };
+}
+function mixColorTowardRamp(cBase, shiftedCol, targetRampInfo, alpha) {
+  if (!targetRampInfo || alpha <= 0.01) return shiftedCol;
+  const b = brightnessOf(shiftedCol), tr = targetRampInfo.ramp;
+  const tgtCol = tr[clamp(Math.round(b * (tr.length - 1)), 0, tr.length - 1)];
+  if (alpha >= 0.99) return tgtCol;
+  const rgb = [0, 1, 2].map((k) => Math.round((1 - alpha) * S.pal[shiftedCol][k] + alpha * S.pal[tgtCol][k]));
+  const rm = S.rampOf[cBase];
+  const cand = rm ? [...new Set([...S.ramps.get(rm.name), ...tr])] : null;
+  return nearest(rgb, cand);
+}
+function putShaded(x, y, srcColor, d, o) {
+  const shSpec = o?.shadow_ramp !== undefined ? parseRampMix(o.shadow_ramp, o.shadow_mix, 45) : null;
+  const hiKey = o?.hi_ramp ?? o?.light_ramp;
+  const hiSpec = hiKey !== undefined ? parseRampMix(hiKey, o.hi_mix ?? o.light_mix, 40) : null;
+  if (!shSpec && !hiSpec) { if (d !== 0) putRel(x, y, srcColor, d); return; }
+  const shifted = shadeIdx(srcColor, d);
+  let outCol = shifted;
+  if (d < 0 && shSpec) outCol = mixColorTowardRamp(srcColor, shifted, shSpec, shSpec.mix * clamp(Math.abs(d) / 4, 0.35, 1));
+  else if (d > 0 && hiSpec) outCol = mixColorTowardRamp(srcColor, shifted, hiSpec, hiSpec.mix * clamp(d / 4, 0.35, 1));
+  put(x, y, outCol);
 }
 function putRel(x, y, srcColor, d) {
   if (S.wrap) { x = mod(x, S.w); y = mod(y, S.h); } else if (x < 0 || y < 0 || x >= S.w || y >= S.h) return;
@@ -500,8 +561,8 @@ function evalShapeExpr(expr) {
   return res;
 }
 // scope = region=x,y,w,h AND mask=colors AND shape=expr, tested against a snapshot taken before the command runs.
-function scope(o) {
-  const src = S.px.slice(), R = o.region, M = o.mask;
+function scope(o, srcOverride = null) {
+  const src = srcOverride || S.px.slice(), R = o.region, M = o.mask;
   const SB = o.shape && o.shape !== 'radial' && o.shape !== 'linear' ? evalShapeExpr(o.shape) : null;
   const inS = (x, y) => !SB || (S.wrap ? SB[mod(y, S.h) * S.w + mod(x, S.w)] === 1 : x >= 0 && y >= 0 && x < S.w && y < S.h && SB[y * S.w + x] === 1);
   const inR = (x, y) => !R || (S.wrap ? mod(x - R[0], S.w) < R[2] && mod(y - R[1], S.h) < R[3] : x >= R[0] && y >= R[1] && x < R[0] + R[2] && y < R[1] + R[3]);
@@ -1176,7 +1237,7 @@ function grad(target, x0, y0, x1, y1, o) {
       return;
     }
     const q = Q(a + (b - a) * u, x, y, i, j);
-    if (rel) putRel(x, y, c, q); else put(x, y, r[clamp(q, 0, r.length - 1)]);
+    if (rel) putShaded(x, y, c, q, o); else put(x, y, r[clamp(q, 0, r.length - 1)]);
   });
 }
 function dfill(c, pct, o) { // pattern fill: paints <pct>% of the scoped pixels. bayer=N: ordered grid. noise=SEED: seeded grain
@@ -1456,7 +1517,7 @@ function cavity(o) {
     if (occ <= minF) return;
     const t = clamp((occ - minF) / Math.max(0.05, 1 - minF), 0, 1);
     const q = Q(t * lo, x, y, i, j);
-    if (q > 0) putRel(x, y, c, -q);
+    if (q > 0) putShaded(x, y, c, -q, o);
   });
 }
 function pixelate(n, o) { // each n×n block becomes its most frequent palette index
@@ -1488,7 +1549,8 @@ function resize(w, h) { // nearest-neighbour (syncs px, hmap, and layers)
   };
   S.px = mapBuf(S.px, Uint8Array);
   S.hmap = mapBuf(S.hmap, Float32Array);
-  for (const L of S.layers) L.px = mapBuf(L.px, L.kind === 'base' ? Uint8Array : Int16Array);
+  if (S.albedo) S.albedo = mapBuf(S.albedo, Uint8Array);
+  for (const L of S.layers) { L.px = mapBuf(L.px, L.kind === 'base' ? Uint8Array : Int16Array); if (L.hmap) L.hmap = mapBuf(L.hmap, Float32Array); }
   for (const [k, sb] of S.shapes) S.shapes.set(k, mapBuf(sb, Uint8Array));
   S.w = w; S.h = h; syncLayers(); S.changed++;
 }
@@ -1518,7 +1580,7 @@ function bevel(o) {
       const dark = (lx !== 0 && !sc.has(x - lx * d, y)) || (ly !== 0 && !sc.has(x, y - ly * d));
       if (!lit && !dark) continue;
       const k = o.soft ? d - 1 : 0; // soft: the bevel fades by one step per pixel inward
-      if (lit !== dark) putRel(x, y, c, lit ? Math.max(1, hi - k) : -Math.max(1, lo - k));
+      if (lit !== dark) putShaded(x, y, c, lit ? Math.max(1, hi - k) : -Math.max(1, lo - k), o);
       break;
     }
   });
@@ -1531,7 +1593,8 @@ function shift(dx, dy) { // scroll with wrap — move the seams to the middle to
   };
   S.px = mapBuf(S.px, Uint8Array);
   S.hmap = mapBuf(S.hmap, Float32Array);
-  for (const L of S.layers) L.px = mapBuf(L.px, L.kind === 'base' ? Uint8Array : Int16Array);
+  if (S.albedo) S.albedo = mapBuf(S.albedo, Uint8Array);
+  for (const L of S.layers) { L.px = mapBuf(L.px, L.kind === 'base' ? Uint8Array : Int16Array); if (L.hmap) L.hmap = mapBuf(L.hmap, Float32Array); }
   for (const [k, sb] of S.shapes) S.shapes.set(k, mapBuf(sb, Uint8Array));
   syncLayers(); S.changed++;
 }
@@ -1544,7 +1607,8 @@ function flip(axis) {
   };
   S.px = mapBuf(S.px, Uint8Array);
   S.hmap = mapBuf(S.hmap, Float32Array);
-  for (const L of S.layers) L.px = mapBuf(L.px, L.kind === 'base' ? Uint8Array : Int16Array);
+  if (S.albedo) S.albedo = mapBuf(S.albedo, Uint8Array);
+  for (const L of S.layers) { L.px = mapBuf(L.px, L.kind === 'base' ? Uint8Array : Int16Array); if (L.hmap) L.hmap = mapBuf(L.hmap, Float32Array); }
   for (const [k, sb] of S.shapes) S.shapes.set(k, mapBuf(sb, Uint8Array));
   syncLayers(); S.changed++;
 }
@@ -1645,27 +1709,132 @@ function samplePath(pts, step = 0.5) {
   }
   return samples;
 }
+function crackHeightCmd(a, o, HBUF, writeH) {
+  const [[x0, y0], [x1, y1]] = ptsOf([need(a[1], 'x0,y0'), need(a[2], 'x1,y1')], 2, 'height crack', true);
+  const depth = fnum(o.depth, 3, 'depth'), w = clamp(fnum(o.width ?? o.size, 1.2, 'width'), 1, 4);
+  const nBranch = clamp(num(o.branch, 2, 'branch'), 0, 8), wobble = clamp(fnum(o.wobble, 2.5, 'wobble'), 0, 16);
+  const seed = num(o.seed, 0, 'seed'), sc = scope(o), crackCol = o.color !== undefined ? col(o.color) : null;
+  const lipCol = o.lip !== undefined ? (/^[+-]?\d+$/.test(String(o.lip)) ? { d: parseInt(o.lip, 10) } : col(o.lip)) : null;
+  const segs = [];
+  const subdiv = (ax, ay, bx, by, disp, it, salt) => {
+    if (it <= 0 || Math.hypot(bx - ax, by - ay) < 2) return [[ax, ay], [bx, by]];
+    const dx = bx - ax, dy = by - ay, l = Math.hypot(dx, dy) || 1;
+    const off = (hash(Math.round(ax + bx), Math.round(ay + by), seed, salt) * 2 - 1) * disp;
+    const mx = (ax + bx) * 0.5 - (dy / l) * off, my = (ay + by) * 0.5 + (dx / l) * off;
+    const L = subdiv(ax, ay, mx, my, disp * 0.55, it - 1, salt + 11);
+    const R = subdiv(mx, my, bx, by, disp * 0.55, it - 1, salt + 23);
+    return [...L, ...R.slice(1)];
+  };
+  const mainPath = subdiv(x0, y0, x1, y1, wobble, 3, 201);
+  segs.push(mainPath);
+  for (let b = 0; b < nBranch && mainPath.length >= 3; b++) {
+    const idx = clamp(Math.floor(((b + 1) / (nBranch + 1)) * (mainPath.length - 1)), 1, mainPath.length - 2);
+    const [bx, by] = mainPath[idx], [px, py] = mainPath[idx - 1];
+    const ang = Math.atan2(by - py, bx - px) + ((b & 1 ? 1 : -1) * (0.65 + 0.4 * hash(b, idx, seed, 217)));
+    const bLen = Math.hypot(x1 - x0, y1 - y0) * (0.24 + 0.2 * hash(idx, b, seed, 219));
+    segs.push(subdiv(bx, by, bx + Math.cos(ang) * bLen, by + Math.sin(ang) * bLen, wobble * 0.6, 2, 230 + b * 7));
+  }
+  const crackPx = new Set(), weights = new Map();
+  for (let si = 0; si < segs.length; si++) {
+    for (const [x, y, t] of samplePath(segs[si], 0.4)) {
+      const r = Math.max(0.5, (w * (si === 0 ? 1 - 0.35 * Math.abs(t - 0.5) * 2 : 1 - t * 0.6)) / 2), reach = Math.ceil(r);
+      const ix = Math.round(x), iy = Math.round(y);
+      for (let dy = -reach; dy <= reach; dy++) for (let dx = -reach; dx <= reach; dx++) {
+        const nr = Math.hypot(dx, dy) / r;
+        if (nr > 1) continue;
+        const valW = (1 - nr * 0.65) * (si === 0 ? 1 : 0.7);
+        for (const [sx, sy] of symPoints(ix + dx, iy + dy)) {
+          if (!sc.has(sx, sy)) continue;
+          const k = mod(sy, S.h) * S.w + mod(sx, S.w);
+          crackPx.add(k);
+          if (valW > (weights.get(k) || 0)) weights.set(k, valW);
+        }
+      }
+    }
+  }
+  for (const [k, wt] of weights) writeH(k, -depth * wt);
+  if (lipCol) {
+    for (const k of crackPx) {
+      const lx = (k % S.w) + 1, ly = ((k / S.w) | 0) + 1;
+      if (!S.wrap && (lx >= S.w || ly >= S.h)) continue;
+      const nk = mod(ly, S.h) * S.w + mod(lx, S.w);
+      if (crackPx.has(nk) || !sc.has(lx, ly)) continue;
+      const cur = sc.src[nk];
+      if (!S.fullbright[cur]) { if (typeof lipCol === 'object') putRel(lx, ly, cur, lipCol.d); else put(lx, ly, lipCol); }
+    }
+  }
+  if (crackCol !== null) {
+    for (const k of crackPx) {
+      const cx = k % S.w, cy = (k / S.w) | 0, cur = sc.src[k];
+      if (!S.fullbright[cur]) { if (typeof crackCol === 'object') putRel(cx, cy, cur, crackCol.d); else put(cx, cy, crackCol); }
+    }
+  }
+}
+function ribsHeightCmd(a, o, writeH) {
+  const val = float(need(a[1], 'val'), 'val'), rawPts = ptsOf(a.slice(2), 2, 'height ribs', true);
+  const pts = rawPts.length === 2 ? samplePath(rawPts, 0.5).map(([x, y]) => [x, y]) : evalCurve(rawPts, !!o.closed, rawPts.length > 4);
+  const count = clamp(fnum(o.count, 8, 'count'), 1, 64);
+  const gFrac = clamp(fnum(o.depth, Math.abs(val) * 0.45, 'depth') / Math.max(0.5, Math.abs(val)), 0.05, 1);
+  const sz = clamp(fnum(o.size, 6, 'size'), 1, 64), tp = parseTaper(o.taper, [100, 35]);
+  const sharpPow = clamp(fnum(o.sharp, 50, 'sharp') / 50, 0.25, 3);
+  const sc = scope(o), best = new Map(), grooveCol = o.color !== undefined ? col(o.color) : null, hiCol = o.hi !== undefined ? col(o.hi) : null;
+  for (const [x, y, t] of samplePath(pts, 0.35)) {
+    const r = (sz * evalTaper(tp, t)) / 2;
+    if (r < 0.35) continue;
+    const rib = Math.pow(0.5 + 0.5 * Math.cos(t * count * Math.PI * 2), sharpPow);
+    const profScale = (1 - gFrac) + gFrac * rib;
+    const reach = Math.ceil(r) + 1, ix = Math.round(x), iy = Math.round(y);
+    for (let dy = -reach; dy <= reach; dy++) for (let dx = -reach; dx <= reach; dx++) {
+      const nr = Math.hypot(dx, dy) / Math.max(0.5, r);
+      if (nr > 1) continue;
+      const dome = o.ridge ? (1 - nr) : Math.sqrt(Math.max(0, 1 - nr * nr));
+      const w = dome * profScale;
+      for (const [sx, sy] of symPoints(ix + dx, iy + dy)) {
+        if (!sc.has(sx, sy)) continue;
+        const k = mod(sy, S.h) * S.w + mod(sx, S.w);
+        const prev = best.get(k);
+        if (!prev || w > prev.w) best.set(k, { w, rib, sx, sy });
+      }
+    }
+  }
+  for (const [k, info] of best) {
+    writeH(k, val * info.w);
+    const cur = sc.src[k];
+    if (S.fullbright[cur]) continue;
+    if (grooveCol !== null && info.rib < 0.25) { if (typeof grooveCol === 'object') putRel(info.sx, info.sy, cur, grooveCol.d); else put(info.sx, info.sy, grooveCol); }
+    else if (hiCol !== null && info.rib > 0.88) { if (typeof hiCol === 'object') putRel(info.sx, info.sy, cur, hiCol.d); else put(info.sx, info.sy, hiCol); }
+  }
+}
 function heightCmd(a, o) {
   const sub = a[0] || (o.from ? 'from' : need(a[0], 'height subcommand'));
   const mode = o.mode || (sub === 'set' || sub === 'clear' || sub === 'from' ? 'set' : 'add');
-  if (!['add', 'max', 'set'].includes(mode)) fail('height mode must be add | max | set');
+  if (!['add', 'max', 'set', 'smin'].includes(mode)) fail('height mode must be add | max | set | smin');
+  const HBUF = activeHMap(), kSmooth = fnum(o.k ?? o.smooth, 3, 'k');
   const writeH = (i, val) => {
-    const nv = mode === 'set' ? val : mode === 'max' ? Math.max(S.hmap[i], val) : S.hmap[i] + val;
-    if (S.hmap[i] !== nv) { S.hmap[i] = nv; S.hchanged++; }
+    const nv = mode === 'set' ? val : mode === 'max' ? Math.max(HBUF[i], val) : mode === 'smin' ? (val !== 0 ? sminH(HBUF[i], val, kSmooth) : HBUF[i]) : HBUF[i] + val;
+    if (HBUF[i] !== nv) { HBUF[i] = nv; markHChanged(); }
   };
+  if (sub === 'compose') {
+    if (!S.layers.length) fail('height compose requires layers ("layer new ...")');
+    const getL = (tok) => (/^\d+$/.test(tok) ? S.layers[parseInt(tok, 10)] : S.layers.find((l) => l.name === tok)) || fail(`no layer "${tok}"`);
+    const src = getL(need(a[1], 'src layer')), dst = a[2] ? getL(a[2]) : S.layers[0];
+    blendHeightBuf(dst.hmap, src.hmap, src.kind === 'paint' ? src.px : null, o.mode || src.hmode || 'smin', kSmooth);
+    dst.hused = true; S.hchanged++; syncLayers();
+    return;
+  }
   if (sub === 'clear') {
     const v = a[1] !== undefined ? float(a[1], 'val') : fnum(o.amount, 0, 'amount');
-    S.hmap.fill(v); S.hchanged++; return;
+    HBUF.fill(v); markHChanged(); syncLayers(); return;
   }
   if (sub === 'set' || sub === 'add') {
     const v = float(need(a[1] ?? o.amount, 'val'), 'val'), sc = scope(o);
     sc.each((x, y) => { const wx = mod(x, S.w), wy = mod(y, S.h); writeH(wy * S.w + wx, v); });
-    return;
+    syncLayers(); return;
   }
   if (sub === 'scale') {
     const f = float(need(a[1], 'pct'), 'pct') / 100, sc = scope(o);
-    sc.each((x, y) => { const i = mod(y, S.h) * S.w + mod(x, S.w); S.hmap[i] *= f; S.hchanged++; });
-    return;
+    sc.each((x, y) => { const i = mod(y, S.h) * S.w + mod(x, S.w); HBUF[i] *= f; markHChanged(); });
+    syncLayers(); return;
   }
   if (sub === 'from') {
     const srcKind = a[1] || o.from || 'luma';
@@ -1675,7 +1844,7 @@ function heightCmd(a, o) {
       const t = srcKind === 'step' && S.rampOf[c] ? S.rampOf[c].i / Math.max(1, S.ramps.get(S.rampOf[c].name).length - 1) : lum(S.pal[c]) / 255;
       writeH(mod(y, S.h) * S.w + mod(x, S.w), t * amt);
     });
-    return;
+    syncLayers(); return;
   }
   if (sub === 'inflate') {
     const amt = fnum(o.amount, 6, 'amount'), prof = o.profile || 'round';
@@ -1693,7 +1862,7 @@ function heightCmd(a, o) {
       const p = prof === 'linear' ? u : prof === 'smooth' ? u * u * (3 - 2 * u) : prof === 'dome' ? 1 - (1 - u) * (1 - u) : Math.sqrt(Math.max(0, 1 - (1 - u) * (1 - u)));
       writeH(i, amt * p);
     }
-    return;
+    syncLayers(); return;
   }
   if (sub === 'noise') {
     const seed = num(o.seed, 0, 'seed'), oct = num(o.octaves, 2, 'octaves');
@@ -1713,13 +1882,13 @@ function heightCmd(a, o) {
       if (gamma !== 1) v = Math.pow(v, gamma);
       writeH(i, lo + (hi - lo) * v);
     });
-    return;
+    syncLayers(); return;
   }
   if (sub === 'blur') {
     const R = clamp(num(o.radius, 1, 'radius'), 1, 8), passes = clamp(num(o.passes, 1, 'passes'), 1, 8), bleed = !!o.bleed;
     const sc = scope(o), W = S.w, H = S.h;
     for (let p = 0; p < passes; p++) {
-      const src = S.hmap.slice();
+      const src = HBUF.slice();
       sc.each((x, y) => {
         let sum = 0, ws = 0;
         for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++) {
@@ -1729,10 +1898,10 @@ function heightCmd(a, o) {
           const w = 1 / (1 + Math.hypot(dx, dy));
           sum += getH(nx, ny, src) * w; ws += w;
         }
-        if (ws > 0) { S.hmap[mod(y, H) * W + mod(x, W)] = sum / ws; S.hchanged++; }
+        if (ws > 0) { HBUF[mod(y, H) * W + mod(x, W)] = sum / ws; markHChanged(); }
       });
     }
-    return;
+    syncLayers(); return;
   }
   if (sub === 'bevel') {
     const amt = fnum(o.amount, 6, 'amount'), depth = Math.max(1, fnum(o.depth ?? o.radius, 4, 'depth')), prof = o.profile || 'linear';
@@ -1746,7 +1915,7 @@ function heightCmd(a, o) {
       const p = prof === 'linear' ? u : prof === 'smooth' ? u * u * (3 - 2 * u) : prof === 'dome' ? 1 - (1 - u) * (1 - u) : Math.sqrt(Math.max(0, 1 - (1 - u) * (1 - u)));
       writeH(i, amt * p);
     }
-    return;
+    syncLayers(); return;
   }
   if (sub === 'grad') {
     const [x0, y0, x1, y1] = [coordf(a[1], 'x0', 'x'), coordf(a[2], 'y0', 'y'), coordf(a[3], 'x1', 'x'), coordf(a[4], 'y1', 'y')];
@@ -1757,7 +1926,7 @@ function heightCmd(a, o) {
       const u = clamp(isRadial ? Math.sqrt(((x - x0) ** 2 + (y - y0) ** 2) / L) : ((x - x0) * dx + (y - y0) * dy) / L, 0, 1);
       writeH(mod(y, S.h) * S.w + mod(x, S.w), lo + (hi - lo) * u);
     });
-    return;
+    syncLayers(); return;
   }
   if (sub === 'rect' || sub === 'ellipse' || sub === 'poly') {
     const sc = scope(o), seen = new Set();
@@ -1774,17 +1943,15 @@ function heightCmd(a, o) {
     if (sub === 'rect') {
       const x = coord(a[1], 'x', 'x'), y = coord(a[2], 'y', 'y'), w = coord(a[3], 'w', 'x'), h = coord(a[4], 'h', 'y');
       val = float(need(a[5], 'val'), 'val');
-      rect(hPlot, x, y, w, h, !!o.fill);
-      return;
+      rect(hPlot, x, y, w, h, !!o.fill); syncLayers(); return;
     }
     if (sub === 'poly') {
       val = float(need(a[1], 'val'), 'val');
-      poly(hPlot, ptsOf(a.slice(2), 3, 'height poly'), !!o.fill);
-      return;
+      poly(hPlot, ptsOf(a.slice(2), 3, 'height poly'), !!o.fill); syncLayers(); return;
     }
     const cx = coord(a[1], 'cx', 'x'), cy = coord(a[2], 'cy', 'y'), rx = coord(a[3], 'rx', 'x'), ry = coord(a[4], 'ry', 'y');
     val = float(need(a[5], 'val'), 'val');
-    if (!o.soft && !o.ridge) { ellipse(hPlot, cx, cy, rx, ry, !!o.fill); return; }
+    if (!o.soft && !o.ridge) { ellipse(hPlot, cx, cy, rx, ry, !!o.fill); syncLayers(); return; }
     const rbx = Math.max(1, rx), rby = Math.max(1, ry);
     for (let dy = -ry; dy <= ry; dy++) for (let dx = -rx; dx <= rx; dx++) {
       const nr = Math.hypot(dx / rbx, dy / rby);
@@ -1792,7 +1959,7 @@ function heightCmd(a, o) {
       const u = 1 - nr, w = o.ridge ? u : u * u * (3 - 2 * u);
       for (const [sx, sy] of symPoints(cx + dx, cy + dy)) if (sc.has(sx, sy)) writeH(mod(sy, S.h) * S.w + mod(sx, S.w), val * w);
     }
-    return;
+    syncLayers(); return;
   }
   if (sub === 'stroke' || sub === 'curve' || sub === 'spline') {
     const val = float(need(a[1], 'val'), 'val'), rawPts = ptsOf(a.slice(2), sub === 'curve' ? 3 : sub === 'spline' ? 2 : 1, `height ${sub}`, true);
@@ -1815,9 +1982,11 @@ function heightCmd(a, o) {
       }
     }
     for (const [k, w] of weights) writeH(k, val * w);
-    return;
+    syncLayers(); return;
   }
-  fail(`unknown height subcommand "${sub}" (use: clear | set | add | scale | inflate | bevel | grad | noise | blur | from | rect | ellipse | poly | stroke | curve | spline)`);
+  if (sub === 'crack') { crackHeightCmd(a, o, HBUF, writeH); syncLayers(); return; }
+  if (sub === 'ribs') { ribsHeightCmd(a, o, writeH); syncLayers(); return; }
+  fail(`unknown height subcommand "${sub}" (use: clear | set | add | scale | inflate | bevel | grad | noise | blur | from | compose | rect | ellipse | poly | stroke | curve | spline | crack | ribs)`);
 }
 function masonryCmd(rampName, o, isPlates = false) {
   const r = S.ramps.get(rampName) || fail(`masonry: unknown ramp "${rampName}"`);
@@ -1845,7 +2014,7 @@ function masonryCmd(rampName, o, isPlates = false) {
   const nCx = Math.max(2, Math.round(S.w / 7)), nCy = Math.max(2, Math.round(S.h / 7));
   const wxField = roughAmt > 0 ? buildNoiseField('value', seed + 17, nCx, nCy, 2, 0) : null;
   const wyField = roughAmt > 0 ? buildNoiseField('value', seed + 53, nCx, nCy, 2, 0) : null;
-  const midStep = Math.floor(r.length * 0.48), rivetCol = r[Math.min(r.length - 1, midStep + 3)];
+  const midStep = Math.floor(r.length * 0.48), rivetCol = r[Math.min(r.length - 1, midStep + 3)], HBUF = activeHMap();
   sc.each((x, y) => {
     const hi = mod(y, S.h) * S.w + mod(x, S.w);
     const lx = mod(x - rx0, rw), ly = mod(y - ry0, rh);
@@ -1866,7 +2035,7 @@ function masonryCmd(rampName, o, isPlates = false) {
     const mLocal = roughAmt > 0 ? mortar * (0.75 + 0.5 * (wxField[hi])) : mortar;
     if (dEdge < mLocal) {
       put(x, y, mortarCol);
-      S.hmap[hi] = -Math.max(1, blkH * 0.4); S.hchanged++;
+      HBUF[hi] = -Math.max(1, blkH * 0.4); markHChanged();
       return;
     }
     const dIn = dEdge - mLocal + 1;
@@ -1875,16 +2044,17 @@ function masonryCmd(rampName, o, isPlates = false) {
     const nx = cw > 1 ? (uX - x0) / cw - 0.5 : 0, ny = ch > 1 ? (wLy - y0) / ch - 0.5 : 0;
     const tPlane = tilt * (-nx - ny);
     const surfRough = !isPlates && wxField ? (wxField[hi] - 0.5) * 1.2 * tBevel : 0;
-    S.hmap[hi] = bH * tBevel + tPlane * tBevel + surfRough; S.hchanged++;
+    HBUF[hi] = bH * tBevel + tPlane * tBevel + surfRough; markHChanged();
     const stepShift = Math.round((hash(cx, ry, seed, 134) * 2 - 1) * 1.4);
     let c = r[clamp(midStep + stepShift, 1, r.length - 2)];
     if (rivets && isPlates && cw >= 10 && ch >= 10) {
       const rxD = Math.min(Math.abs(uX - (x0 + mortar + 2)), Math.abs(uX - (x1 - mortar - 3)));
       const ryD = Math.min(Math.abs(ly - (y0 + mortar + 2)), Math.abs(ly - (y1 - mortar - 3)));
-      if (rxD <= 0.6 && ryD <= 0.6) { c = rivetCol; S.hmap[hi] += 1.5; }
+      if (rxD <= 0.6 && ryD <= 0.6) { c = rivetCol; HBUF[hi] += 1.5; }
     }
     put(x, y, c);
   });
+  syncLayers();
 }
 function glowCmd(o) {
   const sc = scope(o), W = S.w, H = S.h, nonEmit = new Uint8Array(W * H);
@@ -1974,7 +2144,49 @@ function sobelGradient(src, x, y) {
             - getH(x - 1, y - 1, src) - 2 * getH(x, y - 1, src) - getH(x + 1, y - 1, src)) / 8;
   return [gx, gy];
 }
-function lightHeight(o) {
+const OPP_DIR = { n: 's', ne: 'sw', e: 'w', se: 'nw', s: 'n', sw: 'ne', w: 'e', nw: 'se' };
+function radialOffs(rad) {
+  const offs = [];
+  for (let dy = -rad; dy <= rad; dy++) for (let dx = -rad; dx <= rad; dx++) {
+    if (!dx && !dy) continue;
+    const d = Math.hypot(dx, dy);
+    if (d <= rad + 0.25) offs.push([dx, dy, 1 / d]);
+  }
+  const wSum = offs.reduce((s, a) => s + a[2], 0) || 1;
+  return { offs, wSum };
+}
+function localMeanDiff(hSrc, x, y, kernel) {
+  const h0 = getH(x, y, hSrc);
+  let meanH = 0;
+  for (const [dx, dy, w] of kernel.offs) meanH += getH(x + dx, y + dy, hSrc) * w;
+  return meanH / kernel.wSum - h0;
+}
+function finishLightAccum(ditherSpec) {
+  if (!S.lightAccum || !S.lightAccum.active) fail('light end: no active "light begin" block');
+  const A = S.lightAccum, W = S.w, H = S.h, D = ditherOpt(ditherSpec || A.dither || 'bayer4'), Q = quantizer(D, W);
+  const allowedList = A.allowedRamps.size ? [...A.allowedRamps].flatMap((nm) => S.ramps.get(nm) || []) : [];
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const idx = y * W + x;
+    if (!A.touched[idx]) continue;
+    const base = A.albedo[idx];
+    if (S.fullbright[base]) continue;
+    const q = Q(A.sumStep[idx], x, y, x, y);
+    let colIdx = q !== 0 ? shadeIdx(base, q) : base;
+    const tw = A.tintW[idx];
+    if (tw > 0.01) {
+      const blend = clamp(tw, 0, 1);
+      const tRgb = [A.tintR[idx] / tw, A.tintG[idx] / tw, A.tintB[idx] / tw];
+      const rgb = [0, 1, 2].map((k) => Math.round((1 - blend) * S.pal[colIdx][k] + blend * tRgb[k]));
+      const rm = S.rampOf[base];
+      const cand = rm ? [...new Set([...S.ramps.get(rm.name), ...allowedList])] : (allowedList.length ? allowedList : null);
+      colIdx = nearest(rgb, cand);
+    }
+    put(x, y, colIdx);
+  }
+  S.lastLights = A.cmds.slice();
+  S.lightAccum = null;
+}
+function lightHeight(o, record = true) {
   const dTok = o.dir || 'nw', Dvec = DIRS[dTok];
   if (!Dvec) fail(`dir must be one of: ${Object.keys(DIRS).join(' ')}`);
   const dl = Math.hypot(Dvec[0], Dvec[1]) || 1, lx0 = Dvec[0] / dl, ly0 = Dvec[1] / dl;
@@ -1991,15 +2203,29 @@ function lightHeight(o) {
   const aoAmt = fnum(o.ao, 0, 'ao'), aoRad = clamp(num(o.ao_radius, 4, 'ao_radius'), 1, 12);
   const shSteps = clamp(num(o.shadow, 0, 'shadow'), 0, 64);
   const targetRamp = o.ramp ? (S.ramps.get(o.ramp) || fail(`light: unknown ramp "${o.ramp}"`)) : null;
-  const hl = Math.hypot(Lx, Ly, Lz + 1) || 1, Hx = Lx / hl, Hy = Ly / hl, Hz = (Lz + 1) / hl;
-  const aoOffs = [];
-  if (aoAmt > 0) for (let dy = -aoRad; dy <= aoRad; dy++) for (let dx = -aoRad; dx <= aoRad; dx++) {
-    if (!dx && !dy) continue;
-    const d = Math.hypot(dx, dy);
-    if (d <= aoRad + 0.25) aoOffs.push([dx, dy, 1 / d]);
+  const shSpec = parseRampMix(o.shadow_ramp, o.shadow_mix, 45);
+  const hiSpec = parseRampMix(o.hi_ramp ?? o.light_ramp, o.hi_mix ?? o.light_mix, 40);
+  const rimTok = o.rim || (o.rim_ramp ? OPP_DIR[dTok] : null);
+  let Rx = 0, Ry = 0, Rz = 0, rimAmt = 0;
+  const rimSpec = parseRampMix(o.rim_ramp, o.rim_mix, 65);
+  if (rimTok) {
+    const Rv = DIRS[rimTok] || fail(`rim must be one of: ${Object.keys(DIRS).join(' ')}`);
+    const rl = Math.hypot(Rv[0], Rv[1]) || 1, rel = (clamp(fnum(o.rim_elev, 25, 'rim_elev'), 1, 89) * Math.PI) / 180;
+    Rx = (Rv[0] / rl) * Math.cos(rel); Ry = (Rv[1] / rl) * Math.cos(rel); Rz = Math.sin(rel);
+    rimAmt = fnum(o.rim_strength, 2, 'rim_strength');
   }
-  const aoWSum = aoOffs.reduce((s, a) => s + a[2], 0) || 1;
-  const hSrc = S.hmap, sc = scope(o), Q = quantizer(D, regionOf(o)[2]), tanEl = Math.tan(el);
+  const accum = !!(S.lightAccum && S.lightAccum.active);
+  if (accum) {
+    if (record) S.lightAccum.cmds.push({ o: { ...o } });
+    if (shSpec) S.lightAccum.allowedRamps.add(shSpec.name);
+    if (hiSpec) S.lightAccum.allowedRamps.add(hiSpec.name);
+    if (rimSpec) S.lightAccum.allowedRamps.add(rimSpec.name);
+  } else if (record) {
+    S.lastLights = [{ o: { ...o } }];
+  }
+  const hl = Math.hypot(Lx, Ly, Lz + 1) || 1, Hx = Lx / hl, Hy = Ly / hl, Hz = (Lz + 1) / hl;
+  const aoKernel = aoAmt > 0 ? radialOffs(aoRad) : null;
+  const hSrc = S.hmap, sc = scope(o, accum ? S.lightAccum.albedo : null), Q = quantizer(D, regionOf(o)[2]), tanEl = Math.tan(el);
   sc.each((x, y, c, i, j) => {
     if (S.fullbright[c]) return;
     const [gx, gy] = sobelGradient(hSrc, x, y);
@@ -2016,7 +2242,7 @@ function lightHeight(o) {
     }
     let sf;
     const minNdotl = -Math.cos(el);
-    if (targetRamp) {
+    if (targetRamp && !accum) {
       const t = clamp((ndotl * litFactor - minNdotl) / Math.max(0.1, 1 - minNdotl), 0, 1);
       sf = lo + (hi - lo) * t;
     } else {
@@ -2029,32 +2255,56 @@ function lightHeight(o) {
       sf += Math.pow(ndoth, gloss) * specAmt;
     }
     if (aoAmt > 0) {
-      const h0 = getH(x, y, hSrc);
-      let meanH = 0;
-      for (const [dx, dy, w] of aoOffs) meanH += getH(x + dx, y + dy, hSrc) * w;
-      const diff = meanH / aoWSum - h0;
+      const diff = localMeanDiff(hSrc, x, y, aoKernel);
       if (diff > 0) sf -= clamp(diff / Math.max(0.5, aoRad * 0.45), 0, 1) * aoAmt;
     }
-    const q = Q(sf, x, y, i, j);
-    if (targetRamp) put(x, y, targetRamp[clamp(q, 0, targetRamp.length - 1)]);
-    else if (q !== 0) putRel(x, y, c, q);
+    const rimF = rimTok ? clamp((1 - nz * 0.8) * Math.max(0, nx * Rx + ny * Ry + nz * Rz), 0, 1) : 0;
+    const rimSf = rimF * rimAmt;
+    if (accum) {
+      const idx = mod(y, S.h) * S.w + mod(x, S.w), A = S.lightAccum;
+      A.touched[idx] = 1;
+      A.sumStep[idx] += sf + rimSf;
+      const addTint = (spec, w) => {
+        if (!spec || w <= 0.01) return;
+        const b = clamp(brightnessOf(c) + (sf + rimSf) * 0.06, 0, 1);
+        const colRgb = S.pal[spec.ramp[clamp(Math.round(b * (spec.ramp.length - 1)), 0, spec.ramp.length - 1)]];
+        A.tintR[idx] += colRgb[0] * w; A.tintG[idx] += colRgb[1] * w; A.tintB[idx] += colRgb[2] * w; A.tintW[idx] += w;
+      };
+      if (shSpec && sf < 0) addTint(shSpec, shSpec.mix * clamp(Math.abs(sf) / 4, 0.35, 1));
+      if (hiSpec && sf > 0) addTint(hiSpec, hiSpec.mix * clamp(sf / 4, 0.35, 1));
+      if (rimSpec && rimSf > 0.05) addTint(rimSpec, rimSpec.mix * rimF);
+      return;
+    }
+    const q = Q(sf + rimSf, x, y, i, j);
+    if (targetRamp) { put(x, y, targetRamp[clamp(q, 0, targetRamp.length - 1)]); return; }
+    let outCol = q !== 0 ? shadeIdx(c, q) : c;
+    if (shSpec && sf < -0.25) outCol = mixColorTowardRamp(c, outCol, shSpec, shSpec.mix * clamp(Math.abs(sf) / 4, 0.35, 1));
+    else if (hiSpec && sf > 0.25) outCol = mixColorTowardRamp(c, outCol, hiSpec, hiSpec.mix * clamp(sf / 4, 0.35, 1));
+    if (rimSpec && rimSf > 0.25) outCol = mixColorTowardRamp(c, outCol, rimSpec, rimSpec.mix * rimF);
+    if (outCol !== c) put(x, y, outCol);
   });
 }
 function hatch(colTok, o) {
   const c = colTok ? col(colTok) : { d: num(o.shade, -1, 'shade') };
-  const rel = typeof c === 'object', follow = o.follow || 'none';
+  const rel = typeof c === 'object', follow = o.follow || 'none', zone = o.in || 'all';
   if (!['none', 'contour', 'slope'].includes(follow)) fail('hatch follow must be none | contour | slope');
+  if (!['all', 'shadow', 'mid', 'light'].includes(zone)) fail('hatch in= must be all | shadow | mid | light');
   const spacing = clamp(num(o.spacing, 3, 'spacing'), 1, 32), seed = num(o.seed, 0, 'seed');
   const jitter = fnum(o.jitter, 0, 'jitter'), dftAng = follow === 'none' ? -45 : 0;
   const passes = o.cross ? [fnum(o.angle, dftAng, 'angle'), fnum(o.angle, dftAng, 'angle') + 90] : [fnum(o.angle, dftAng, 'angle')];
   const sc = scope(o), seen = new Set();
+  const inZone = (cur) => {
+    if (zone === 'all') return true;
+    const b = brightnessOf(cur);
+    return zone === 'shadow' ? b <= 0.52 : zone === 'mid' ? b >= 0.25 && b <= 0.72 : b >= 0.55;
+  };
   const plotHatch = (px, py) => {
     px = Math.round(px); py = Math.round(py);
     if (!sc.has(px, py)) return;
     const wx = S.wrap ? mod(px, S.w) : px, wy = S.wrap ? mod(py, S.h) : py, k = wy * S.w + wx;
     if (seen.has(k)) return;
     const cur = get(px, py, sc.src);
-    if (rel && S.fullbright[cur]) return;
+    if ((rel && S.fullbright[cur]) || !inZone(cur)) return;
     seen.add(k);
     if (rel) putRel(px, py, cur, c.d); else put(px, py, c);
   };
@@ -2142,6 +2392,142 @@ function hatch(colTok, o) {
       for (const [px, py] of allPts) plotHatch(px, py);
     }
   }
+}
+function parseLenRange(v, dfltLo = 6, dfltHi = 16) {
+  if (v === undefined) return [dfltLo, dfltHi];
+  const m = /^(\d+)\.\.(\d+)$/.exec(String(v));
+  if (m) return [Math.max(1, +m[1]), Math.max(1, +m[2])];
+  const n = clamp(int(v, 'len'), 1, 256);
+  return [Math.max(1, Math.round(n * 0.6)), n];
+}
+function dripCmd(tok, o) {
+  const dirTok = o.dir || 's', Dv = DIRS[dirTok] || fail(`dir must be one of: ${Object.keys(DIRS).join(' ')}`);
+  const [dx, dy] = Dv, pxOff = -dy, pyOff = dx;
+  const [lenLo, lenHi] = parseLenRange(o.len, 6, 16);
+  const wid = clamp(num(o.width, 1, 'width'), 1, 3), dens = clamp(num(o.density, 45, 'density'), 1, 100) / 100;
+  const seed = num(o.seed, 0, 'seed'), D = ditherOpt(o.dither || 'bayer4'), isTint = !!o.tint;
+  const rTarget = tok && tok !== 'shade' && S.ramps.has(tok) ? S.ramps.get(tok) : null;
+  const absCol = (!rTarget && tok !== 'shade' && tok !== undefined) ? col(tok) : null;
+  const shadeAmt = num(o.shade, -3, 'shade');
+  const regSc = scope({ region: o.region, protect: o.protect });
+  const srcSc = (o.mask || o.shape) && o.from !== 'cavity' ? scope(o, regSc.src) : null;
+  const kernel = radialOffs(2), [rx0, ry0, rw, rh] = regionOf(o), seeds = [];
+  for (let j = 0; j < rh; j++) for (let i = 0; i < rw; i++) {
+    const x = rx0 + i, y = ry0 + j;
+    if (srcSc) {
+      if (srcSc.has(x, y) && (o.from === 'all' || !srcSc.has(x + dx, y + dy))) seeds.push([x, y]);
+    } else if (S.hchanged > 0) {
+      if (localMeanDiff(S.hmap, x, y, kernel) > 0.35) seeds.push([x, y]);
+    } else if (hash(x, y, seed, 300) < 0.05) {
+      seeds.push([x, y]);
+    }
+  }
+  const paintPx = (px, py, cov, step) => {
+    if (!regSc.inR(px, py)) return;
+    const cur = get(px, py, regSc.src);
+    if (cur < 0 || S.fullbright[cur] || (o.protect && o.protect[cur])) return;
+    if (cov <= (D.kind === 'none' ? 0.3 : thr(D, px, py))) return;
+    if (rTarget) {
+      const targetIdx = isTint ? rTarget[clamp(Math.round(brightnessOf(cur) * (rTarget.length - 1)), 0, rTarget.length - 1)] : rTarget[clamp(Math.round(rTarget.length * 0.28 + (1 - step) * 2), 0, rTarget.length - 1)];
+      put(px, py, mixColorTowardRamp(cur, cur, { ramp: rTarget }, clamp(cov, 0.3, 0.9)));
+      if (!isTint && cov > 0.7) put(px, py, targetIdx);
+    } else if (absCol !== null) {
+      if (typeof absCol === 'object') putRel(px, py, cur, Math.round(absCol.d * cov));
+      else put(px, py, absCol);
+    } else {
+      putRel(px, py, cur, Math.round(shadeAmt * cov));
+    }
+  };
+  for (const [sx, sy] of seeds) {
+    if (hash(sx, sy, seed, 301) >= dens) continue;
+    const L = Math.round(lenLo + (lenHi - lenLo) * hash(sx, sy, seed, 302));
+    let cx = sx + dx, cy = sy + dy;
+    for (let s = 1; s <= L; s++) {
+      const t = 1 - (s - 1) / Math.max(1, L);
+      if (hash(sx, sy, s, seed + 305) < 0.18) {
+        const j = hash(sx, s, seed, 307) < 0.5 ? -1 : 1;
+        cx += pxOff * j; cy += pyOff * j;
+      }
+      const hw = Math.floor(((wid - 1) * t) / 2);
+      for (let w = -hw; w <= hw; w++) paintPx(cx + pxOff * w, cy + pyOff * w, t, s / L);
+      cx += dx; cy += dy;
+    }
+  }
+}
+function washCmd(tok, o) {
+  const rad = clamp(num(o.radius, 3, 'radius'), 1, 8), str = clamp(fnum(o.strength, 65, 'strength'), 1, 200) / 100;
+  const D = ditherOpt(o.dither || 'bayer4'), sc = scope(o), kernel = radialOffs(rad);
+  const rTarget = tok && tok !== 'shade' && S.ramps.has(tok) ? S.ramps.get(tok) : null;
+  const absCol = (!rTarget && tok !== 'shade' && tok !== undefined) ? col(tok) : null;
+  const Q = quantizer(D, regionOf(o)[2]);
+  sc.each((x, y, c, i, j) => {
+    if (S.fullbright[c]) return;
+    let occ = 0;
+    if (S.hchanged > 0) {
+      occ = clamp(localMeanDiff(S.hmap, x, y, kernel) / Math.max(0.5, rad * 0.45), 0, 1);
+    } else {
+      let outW = 0;
+      for (const [dx, dy, w] of kernel.offs) if (!sc.has(x + dx, y + dy)) outW += w;
+      occ = clamp((outW / kernel.wSum) * 1.6, 0, 1);
+    }
+    const cov = clamp(occ * str, 0, 1);
+    if (cov <= 0.05) return;
+    if (rTarget) {
+      if (cov > (D.kind === 'none' ? 0.35 : thr(D, x, y))) put(x, y, mixColorTowardRamp(c, shadeIdx(c, -1), { ramp: rTarget }, clamp(cov, 0.35, 0.95)));
+    } else if (absCol !== null) {
+      if (cov > (D.kind === 'none' ? 0.35 : thr(D, x, y))) {
+        if (typeof absCol === 'object') putRel(x, y, c, Math.round(absCol.d * cov));
+        else put(x, y, absCol);
+      }
+    } else {
+      const q = Q(-3 * cov, x, y, i, j);
+      if (q < 0) putRel(x, y, c, q);
+    }
+  });
+}
+function drybrushCmd(tok, o, isEdgewear = false) {
+  const th = fnum(o.thresh, isEdgewear ? 0.35 : 0.45, 'thresh'), str = clamp(fnum(o.strength, 75, 'strength'), 1, 200) / 100;
+  const brk = clamp(num(o.breakup, isEdgewear ? 55 : 45, 'breakup'), 0, 100) / 100, seed = num(o.seed, 0, 'seed');
+  const D = ditherOpt(o.dither || 'bayer4'), sc = scope(o), kernel = radialOffs(1);
+  const Ltok = o.light || o.dir || (isEdgewear ? 'nw' : null);
+  let lx = 0, ly = 0;
+  if (Ltok) {
+    const Dv = DIRS[Ltok] || fail(`light/dir must be one of: ${Object.keys(DIRS).join(' ')}`);
+    const dl = Math.hypot(Dv[0], Dv[1]) || 1; lx = Dv[0] / dl; ly = Dv[1] / dl;
+  }
+  const nField = brk > 0 ? buildNoiseField('value', seed + 71, Math.max(2, Math.round(S.w / 6)), Math.max(2, Math.round(S.h / 6)), 2, 0) : null;
+  const rTarget = tok && S.ramps.has(tok) ? S.ramps.get(tok) : null;
+  const hiCol = !rTarget ? (tok ? col(tok) : { d: num(o.hi, 2, 'hi') }) : null;
+  const Q = quantizer(D, regionOf(o)[2]);
+  sc.each((x, y, c, i, j) => {
+    if (S.fullbright[c]) return;
+    let conv = 0;
+    if (S.hchanged > 0) {
+      conv = -localMeanDiff(S.hmap, x, y, kernel);
+      if (Ltok) {
+        const [gx, gy] = sobelGradient(S.hmap, x, y), gl = Math.hypot(gx, gy) || 1;
+        const align = clamp((-gx / gl) * lx + (-gy / gl) * ly, -1, 1);
+        if (align < -0.2) conv *= 0.25; else conv *= 0.65 + 0.65 * align;
+      }
+    } else {
+      let outN = 0;
+      for (const [dx, dy] of N4) if (!sc.has(x + dx, y + dy)) outN++;
+      conv = outN >= 2 ? outN * 0.45 : outN === 1 ? 0.5 : 0;
+    }
+    if (conv < th) return;
+    const idx = mod(y, S.h) * S.w + mod(x, S.w);
+    const nMod = nField ? clamp(1 - brk + brk * (nField[idx] * 1.4), 0, 1.2) : 1;
+    const cov = clamp(((conv - th) / Math.max(0.4, th * 2)) * str * nMod, 0, 1);
+    if (cov <= 0.1) return;
+    if (rTarget) {
+      if (cov > (D.kind === 'none' ? 0.35 : thr(D, x, y))) put(x, y, mixColorTowardRamp(c, shadeIdx(c, 1), { ramp: rTarget }, clamp(cov, 0.4, 0.95)));
+    } else if (typeof hiCol === 'object') {
+      const q = Q(hiCol.d * cov, x, y, i, j);
+      if (q !== 0) putRel(x, y, c, q);
+    } else if (cov > (D.kind === 'none' ? 0.35 : thr(D, x, y))) {
+      put(x, y, hiCol);
+    }
+  });
 }
 
 // ─────────────────────────────────────────────────────────────── 2D CSG shape masks (shape add/sub/show/fill/outline)
@@ -2693,23 +3079,40 @@ def('sym', 'off | x | y | xy [axis=N|ax,ay|anchor] [jitter=N] [seed=N]', 'Mirror
   S.sym.seed = num(o.seed, 0, 'seed');
   out(`sym ${S.sym.mode} axis=${S.sym.ax ?? 'center'},${S.sym.ay ?? 'center'} jitter=${S.sym.jitter}`);
 });
-def('layer', 'new [name] [shade] | merge [mode=replace|shade] | list | select <name|idx> | drop | clear | vis <on|off>',
-  'Manage layers (overlay paint layers with transparency, or "shade" step-delta layers).', (a, o) => {
+def('layer', 'new [name] [shade] [hmode=add|max|over|smin] [k=2.5] | hmode <add|max|over|smin> [k=2.5] | merge [mode=replace|shade] | list | select <name|idx> | drop | clear | vis <on|off>',
+  'Manage layers (overlay paint/shade layers + per-layer height blending via add|max|over|smin).', (a, o) => {
   needCanvas();
   const sub = a[0] || 'list';
-  const ensureBase = () => { if (!S.layers.length) { S.layers.push({ name: 'base', kind: 'base', px: S.px.slice(), visible: true }); S.activeLayer = 0; } };
+  const ensureBase = () => {
+    if (!S.layers.length) {
+      S.layers.push({ name: 'base', kind: 'base', px: S.px.slice(), hmap: S.hmap.slice(), hused: S.hchanged > 0, hmode: 'replace', smoothR: 2.5, visible: true });
+      S.activeLayer = 0;
+    }
+  };
   if (sub === 'new') {
     ensureBase();
     const isShade = !!o.shade || a.includes('shade');
     const nm = a.slice(1).find((t) => t !== 'shade') || `layer${S.layers.length}`;
+    const hm = o.hmode || 'add';
+    if (!['add', 'max', 'over', 'smin'].includes(hm)) fail('layer hmode must be add | max | over | smin');
+    const sr = fnum(o.k ?? o.smooth, 2.5, 'k');
     const px = isShade ? new Int16Array(S.w * S.h) : new Int16Array(S.w * S.h).fill(-1);
-    S.layers.push({ name: nm, kind: isShade ? 'shade' : 'paint', px, visible: true });
+    S.layers.push({ name: nm, kind: isShade ? 'shade' : 'paint', px, hmap: new Float32Array(S.w * S.h), hused: false, hmode: hm, smoothR: sr, visible: true });
     S.activeLayer = S.layers.length - 1;
     syncLayers();
-    out(`layer: created "${nm}" (${isShade ? 'shade' : 'paint'}, #${S.activeLayer})`);
+    out(`layer: created "${nm}" (${isShade ? 'shade' : 'paint'}, hmode=${hm}, #${S.activeLayer})`);
+  } else if (sub === 'hmode') {
+    ensureBase();
+    const L = S.layers[S.activeLayer];
+    const hm = need(a[1], 'mode');
+    if (!['add', 'max', 'over', 'smin'].includes(hm)) fail('layer hmode must be add | max | over | smin');
+    L.hmode = hm;
+    if ((o.k ?? o.smooth) !== undefined) L.smoothR = fnum(o.k ?? o.smooth, 2.5, 'k');
+    syncLayers(); S.hchanged++;
+    out(`layer: "${L.name}" hmode=${L.hmode} k=${L.smoothR}`);
   } else if (sub === 'list') {
     if (!S.layers.length) return out('layers: [0] base (single canvas)');
-    S.layers.forEach((l, idx) => out(`  ${idx === S.activeLayer ? '*' : ' '} [${idx}] ${l.name} (${l.kind}${l.visible ? '' : ', hidden'})`));
+    S.layers.forEach((l, idx) => out(`  ${idx === S.activeLayer ? '*' : ' '} [${idx}] ${l.name} (${l.kind}${l.hused ? `, h=${l.hmode}` : ''}${l.visible ? '' : ', hidden'})`));
   } else if (sub === 'select') {
     ensureBase();
     const tok = need(a[1], 'layer');
@@ -2726,12 +3129,12 @@ def('layer', 'new [name] [shade] | merge [mode=replace|shade] | list | select <n
   } else if (sub === 'clear') {
     if (!S.layers.length || S.layers[S.activeLayer].kind === 'base') fail('layer clear only clears overlay/shade layers');
     const L = S.layers[S.activeLayer];
-    L.px.fill(L.kind === 'shade' ? 0 : -1); syncLayers(); S.changed++;
+    L.px.fill(L.kind === 'shade' ? 0 : -1); L.hmap.fill(0); L.hused = false; syncLayers(); S.changed++;
   } else if (sub === 'drop') {
     if (S.layers.length <= 1 || S.activeLayer === 0) fail('cannot drop base layer');
     const [rm] = S.layers.splice(S.activeLayer, 1);
     S.activeLayer = Math.min(S.activeLayer, S.layers.length - 1);
-    if (S.layers.length === 1) { S.px = S.layers[0].px.slice(); S.layers = []; S.activeLayer = -1; }
+    if (S.layers.length === 1) { S.px = S.layers[0].px.slice(); S.hmap = S.layers[0].hmap.slice(); S.layers = []; S.activeLayer = -1; }
     syncLayers(); S.changed++;
     out(`layer: dropped "${rm.name}"`);
   } else if (sub === 'merge') {
@@ -2755,9 +3158,13 @@ def('layer', 'new [name] [shade] | merge [mode=replace|shade] | list | select <n
         }
       }
     }
+    if (top.hused && top.hmap && below.hmap) {
+      blendHeightBuf(below.hmap, top.hmap, top.kind === 'paint' ? top.px : null, top.hmode || 'add', top.smoothR || 2.5);
+      below.hused = true;
+    }
     S.layers.splice(S.activeLayer, 1);
     S.activeLayer--;
-    if (S.layers.length === 1) { S.px = S.layers[0].px.slice(); S.layers = []; S.activeLayer = -1; }
+    if (S.layers.length === 1) { S.px = S.layers[0].px.slice(); S.hmap = S.layers[0].hmap.slice(); S.layers = []; S.activeLayer = -1; }
     syncLayers(); S.changed++;
     out(`layer: merged "${top.name}" (${mode})`);
   } else fail(`unknown layer subcommand "${sub}"`);
@@ -2871,8 +3278,8 @@ def('chip', 'mask=<shape> [prob=P] [size=1..3] [face=n] [seed=N]', 'Knock chunks
 def('smudge', '[radius=N] [strength=%] [dir=x|y|d1|d2|n|s|e|w…] [len=N] [passes=N] [protect=…] [blend=ramp|nearest ramps=a,b] [mask=…] [seed=N]', 'Blur inside the palette: mixes ramp steps of same-ramp neighbours, so stone never bleeds into moss. dir= gives a directional drag.', (a, o) => { needCanvas(); smudge(o); }, true);
 def('cavity', '[mask=<shape>] [against=<colors>] [radius=1..6] [lo=N] [min=%] [dither=…] [seed=N]', 'Ambient occlusion / contact shadow: darkens pixels crowded by what is outside the shape (or by "against" colors).', (a, o) => { needCanvas(); cavity(o); }, true);
 def('bevel', '[mask=<shape>] [region=x,y,w,h] [light=n|ne|e|se|s|sw|w|nw] [depth=N] [hi=N] [lo=N] [soft]', 'Edge lighting: edges facing the light get +hi ramp steps, edges facing away -lo. soft fades one step per pixel inward.', (a, o) => { needCanvas(); bevel(o); }, true, ['soft']);
-def('height', 'inflate|bevel|add|set|scale|grad|noise|blur|from|rect|ellipse|poly|stroke|curve|spline|clear ...',
-  'Sculpt the parallel height channel (e.g. "height inflate", "height bevel depth=3", "height stroke -4 10,10 20,20 size=3 soft", "height grad 0 0 0 32 from=4 to=0 [radial]").', (a, o) => {
+def('height', 'inflate|bevel|add|set|scale|grad|noise|blur|from|compose|rect|ellipse|poly|stroke|curve|spline|crack|ribs|clear ...',
+  'Sculpt the parallel height channel (supports mode=add|max|set|smin, branched cracks, and periodic ribs along curves).', (a, o) => {
   needCanvas(); heightCmd(a, o);
 }, false, ['bleed', 'fill', 'soft', 'ridge', 'closed', 'radial']);
 def('masonry', '<ramp> [style=running|grid|ashlar] [w=32 h=16 | cols=N rows=N] [mortar=2] [mortar_color=<c>] [bevel=3] [height=5] [vary=2] [tilt=1] [rough=1.8] [chip=35] [rivets] [seed=N]',
@@ -2891,14 +3298,62 @@ def('emit', '[mask=<emitters>] [radius=6] [ramp=<name>] [strength=75] [mode=mix|
   'Alias for "glow".', (a, o) => {
   needCanvas(); glowCmd(o);
 }, true, ['normal']);
-def('light', '[height] [dir=nw] [elev=40] [range=-4..+3] [strength=100] [dither=bayer4] [spec=N] [gloss=16] [ao=N] [ao_radius=4] [shadow=N] [ramp=<r>] [mask=…] [region=…]',
-  'Shade the canvas using normals from the height channel (Lambert + optional spec=, ao=, shadow=).', (a, o) => {
-  needCanvas(); lightHeight(o);
+def('albedo', '[save|restore|clear]', 'Snapshot unlit base colors into S.albedo (or restore them) for non-destructive relighting.', (a) => {
+  needCanvas();
+  const sub = a[0] || 'save';
+  if (sub === 'save') { S.albedo = S.px.slice(); out('albedo saved'); }
+  else if (sub === 'clear') { S.albedo = null; out('albedo cleared'); }
+  else if (sub === 'restore') {
+    if (!S.albedo) fail('albedo restore: nothing saved (run "albedo save" or "light begin")');
+    for (let y = 0; y < S.h; y++) for (let x = 0; x < S.w; x++) put(x, y, S.albedo[y * S.w + x]);
+  } else fail('albedo must be save | restore | clear');
+});
+def('light', '[begin [reset] | end | height] [dir=nw] [elev=40] [range=-4..+3] [shadow_ramp=<r[:pct%]>] [hi_ramp=<r[:pct%]>] [rim=<dir>] [rim_ramp=<r[:pct%]>] [rim_strength=2] [spec=N] [ao=N] [shadow=N] ...',
+  'Shade using normals + optional hue-shifting + rim light. Wrap multiple lights in "light begin" ... "light end" for float accumulation over albedo.', (a, o) => {
+  needCanvas();
+  if (a[0] === 'begin') {
+    if (!S.albedo || o.reset || a.includes('reset')) S.albedo = S.px.slice();
+    S.lightAccum = {
+      active: true, albedo: S.albedo.slice(), sumStep: new Float32Array(S.w * S.h),
+      tintR: new Float32Array(S.w * S.h), tintG: new Float32Array(S.w * S.h), tintB: new Float32Array(S.w * S.h), tintW: new Float32Array(S.w * S.h),
+      touched: new Uint8Array(S.w * S.h), allowedRamps: new Set(), dither: o.dither || 'bayer4', cmds: [],
+    };
+    return;
+  }
+  if (a[0] === 'end') { finishLightAccum(o.dither); return; }
+  lightHeight(o);
+}, true, ['reset']);
+def('relight', '[dither=bayer4]', 'Replay the saved light stack non-destructively over S.albedo and current S.hmap.', (a, o) => {
+  needCanvas();
+  if (!S.albedo || !S.lastLights.length) fail('relight needs "albedo save" (or "light begin") and at least one prior "light" command');
+  S.lightAccum = {
+    active: true, albedo: S.albedo.slice(), sumStep: new Float32Array(S.w * S.h),
+    tintR: new Float32Array(S.w * S.h), tintG: new Float32Array(S.w * S.h), tintB: new Float32Array(S.w * S.h), tintW: new Float32Array(S.w * S.h),
+    touched: new Uint8Array(S.w * S.h), allowedRamps: new Set(), dither: o.dither || 'bayer4', cmds: [],
+  };
+  for (const item of S.lastLights) lightHeight(item.o, true);
+  finishLightAccum(o.dither);
 }, true);
-def('hatch', '[color] [mask=…] [region=…] [follow=none|contour|slope] [angle=-30] [spacing=3] [shade=-1] [jitter=1] [cross] [seed=N]',
-  'Draw directional or contour-following hatch strokes across the scoped area.', (a, o) => {
+def('hatch', '[color] [in=all|shadow|mid|light] [mask=…] [region=…] [follow=none|contour|slope] [angle=-30] [spacing=3] [shade=-1] [jitter=1] [cross] [seed=N]',
+  'Draw directional or contour-following hatch strokes (optionally limited to shadow/mid/light tones).', (a, o) => {
   needCanvas(); hatch(a[0], o);
 }, true, ['cross']);
+def('drip', '[color|ramp|shade] [from=cavity|mask|all] [dir=s|n|e|w] [len=6..16] [width=1..3] [density=45] [shade=-3] [tint] [dither=…] [protect=…] [seed=N]',
+  'Cast gravity-driven weathering drips from crevices, mortar, rivets, or masked shapes.', (a, o) => {
+  needCanvas(); dripCmd(a[0], o);
+}, true, ['tint']);
+def('wash', '[color|ramp|shade] [radius=3] [strength=65] [dither=…] [mask=…] [shape=…] [region=…]',
+  'Pool grime, verdigris, or shadow wash inside concave height crevices and corners.', (a, o) => {
+  needCanvas(); washCmd(a[0], o);
+}, true);
+def('drybrush', '[color|ramp|+n] [thresh=0.45] [strength=75] [breakup=45] [light=dir] [hi=+2] [dither=…] [seed=N]',
+  'Highlight convex ridges and chipped edges on the height map with noise breakup.', (a, o) => {
+  needCanvas(); drybrushCmd(a[0], o, false);
+}, true);
+def('edgewear', '[color|ramp|+n] [thresh=0.35] [strength=75] [breakup=55] [light=nw] [hi=+2] [dither=…] [seed=N]',
+  'Alias for directional convex edge wear ("drybrush light=nw breakup=55").', (a, o) => {
+  needCanvas(); drybrushCmd(a[0], o, true);
+}, true);
 def('outline', '<color> mask=<shape> [side=outer|inner] [diag]', 'Draw an outline just outside (or just inside) a shape.', (a, o) => { needCanvas(); outline(col(a[0]), o); }, true, ['diag']);
 def('pixelate', '<n> [mask=…] [region=…]', 'Each n×n block becomes its most frequent palette index.', (a, o) => { needCanvas(); pixelate(int(a[0], 'n'), o); }, true);
 def('resize', '<w> <h>', 'Nearest-neighbour resize of the whole canvas (and height/layers).', (a) => { needCanvas(); resize(int(a[0], 'w'), int(a[1], 'h')); });
@@ -2947,7 +3402,7 @@ def('save', '<file.png> [scale=N] [tile=N]', 'Write an indexed 8-bit PNG (palett
 });
 
 // ─────────────────────────────────────────────────────────────── option parser, script runner, CLI
-const KNOWN = new Set('against all alpha amount angle angle_jitter ao ao_radius aspect axis bayer bevel bias bleed blend bristles brush center chip clump cols contrast cross density depth dir dither elev face fill flow flow_jitter follow from gloss h height hi jitter jump len light lo mask mid min mode mortar mortar_color n noise normal octaves opacity outline pad passes prob profile protect radial radius ramp ramps range region repeat ridge rivets rot rough round rows scale scalex scaley scatter seed shade shade_jitter shadow shape side size size_jitter skip soft spacing spec spread step strength style sym taper tex_scale tile tilt tint to type vary view w warp'.split(' '));
+const KNOWN = new Set('against all alpha amount angle angle_jitter ao ao_radius aspect axis bayer bevel bias bleed blend branch breakup bristles brush center chip clump cols color contrast count cross density depth dir dither elev face fill flow flow_jitter follow from gloss h height hi hi_mix hi_ramp hmode in jitter jump k len light light_mix light_ramp lip lo mask mid min mode mortar mortar_color n noise normal octaves opacity outline pad passes prob profile protect radial radius ramp ramps range region repeat reset ridge rim rim_elev rim_mix rim_ramp rim_strength rivets rot rough round rows scale scalex scaley scatter seed shade shade_jitter shadow shadow_mix shadow_ramp shape sharp side size size_jitter skip smooth soft spacing spec spread step strength style sym taper tex_scale thresh tile tilt tint to type vary view w warp width wobble'.split(' '));
 const parseRegion = (v) => {
   const s = String(v);
   if (s.startsWith('anchor:')) {
@@ -3083,10 +3538,12 @@ function runScript(text, label = 'script') {
       o._warn = warn;
       const isShapeDraw = name === 'shape' && toks.slice(1).some((t) => t === 'fill' || t === 'paint' || t === 'outline');
       const shapeMut = name === 'shape' && a.length > 0 && a[0] !== 'list' && a[0] !== 'show' && a[1] !== 'show';
-      const mutates = cmd.draw || isShapeDraw || shapeMut || ['height', 'resize', 'shift', 'flip'].includes(name) || (name === 'layer' && a[0] && a[0] !== 'list');
+      const deferLight = name === 'light' && (a[0] === 'begin' || (a[0] !== 'end' && S.lightAccum?.active));
+      const isDraw = (cmd.draw && !deferLight) || isShapeDraw || name === 'relight' || (name === 'albedo' && a[0] === 'restore');
+      const mutates = isDraw || shapeMut || ['height', 'resize', 'shift', 'flip', 'albedo'].includes(name) || (name === 'layer' && a[0] && a[0] !== 'list');
       const skipUndo = name === 'undo' || name === 'restore';
       if (mutates && !skipUndo && S.w) pushUndo(toks.join(' ').slice(0, 50));
-      const beforePx = (cmd.draw || isShapeDraw || (name === 'layer' && a[0] && a[0] !== 'list')) && S.w ? S.px.slice() : null;
+      const beforePx = (isDraw || (name === 'layer' && a[0] && a[0] !== 'list')) && S.w ? S.px.slice() : null;
       const before = S.changed, hBefore = S.hchanged;
       S.cmdSeq++;
       const prevSym = (name !== 'sym' && o.sym !== undefined) ? { ...S.sym } : null;
@@ -3104,7 +3561,7 @@ function runScript(text, label = 'script') {
         S.lastDiff = { px: beforePx, cmd: toks.join(' ').slice(0, 60) };
         saveTrace(beforePx, name);
       }
-      if ((cmd.draw || isShapeDraw) && S.changed === before) warn(`"${toks.join(' ').slice(0, 70)}" changed 0 pixels (mask/region matched nothing, or colours already equal)`);
+      if (isDraw && S.changed === before) warn(`"${toks.join(' ').slice(0, 70)}" changed 0 pixels (mask/region matched nothing, or colours already equal)`);
       if (name === 'height' && a[0] !== 'clear' && S.hchanged === hBefore) warn(`"${toks.join(' ').slice(0, 70)}" changed 0 height samples`);
     } catch (e) {
       out(`error ${label}:${n + 1}: ${trimmed.slice(0, 120)}\n  ${e.message}`);

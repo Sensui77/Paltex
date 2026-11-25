@@ -561,5 +561,69 @@ console.log('12. Testing bug fixes: separate Quake fullbrights + bone alias, gra
   assert.ok(im.px[24 * 64 + 39] >= 240 && im.px[24 * 64 + 39] <= 247, 'right sym=x mirrored fb_plasma eye');
 }
 
+console.log('13. Testing artistic Pass 2 tools: hue-shifted light/rim, light begin..end + albedo/relight, layer hmap smin, height crack/ribs, drip, wash, drybrush, hatch in=shadow...');
+{
+  const outPng = path.join(SCRATCH, 't_pass2_tools.png');
+  const stdout = runPTX(`
+    palette quake
+    new 64 64 slate:5
+
+    # Per-layer height with smooth union (smin): base dome + horns layer
+    shape base_dome new
+    shape base_dome add ellipse 32 34 16 14
+    shape base_dome fill bone:7
+    height inflate shape=base_dome amount=7 profile=round mode=set
+
+    layer new horns hmode=smin k=3
+    shape horn new
+    shape horn add curve 18,30 12,18 22,12 size=6 sym=x axis=31.5
+    shape horn fill mud:7
+    height ribs 7 18,30 12,18 22,12 count=6 depth=2 size=6 taper=100,45 color=-2 hi=+1 sym=x axis=31.5
+    layer merge
+
+    # Socket hole for drip + wash source
+    shape socket new
+    shape socket add ellipse 32 34 3 3
+    shape socket fill slate:1
+    height set -3 shape=socket
+
+    # Save unlit albedo, run multi-light block with hue-shifting (purple shadow + gold hi + teal rim)
+    albedo save
+    light begin
+      light height dir=nw elev=40 range=-4..+4 shadow_ramp=purple:55% hi_ramp=gold:35% ao=2 shape=base_dome|horn
+      light height dir=se elev=25 range=0..+2 rim=se rim_ramp=teal:70% rim_strength=2 shape=base_dome|horn
+    light end
+
+    # Carve branched crack with dark fissure & lit lip, then test relight over updated height
+    height crack 24,42 40,48 depth=3 width=1 branch=2 wobble=2 seed=5
+    relight
+    height crack 24,42 40,48 depth=2 width=1 branch=1 wobble=2 color=slate:0 lip=+2 seed=5
+
+    # Hand-painted weathering operators + shadow-only hatching
+    drip blood:5 shape=socket dir=s len=8..10 width=1 density=100 dither=none
+    wash slate radius=2 strength=60 dither=none shape=base_dome|horn
+    drybrush gold:13 thresh=0.5 strength=80 breakup=25 light=nw dither=none shape=base_dome|horn
+    hatch shape=base_dome in=shadow follow=contour spacing=3 shade=-1
+
+    # Test shadow-only hatch on split dark/bright box: dark side hatches, bright grey:14 stays untouched
+    rect 4 4 4 8 grey:2 fill
+    rect 8 4 4 8 grey:14 fill
+    hatch region=4,4,8,8 in=shadow spacing=1 shade=-1
+
+    lint
+    save "${outPng}" scale=2
+  `);
+  assert.match(stdout, /layer: created "horns" .* hmode=smin/);
+  assert.match(stdout, /albedo saved/);
+  assert.match(stdout, /ok: .* 0 warning\(s\)/);
+  const im = readPNGInfo(outPng);
+  // Blood drips below socket (y=38..42, x=32) landed downward onto bone/purple area -> blood ramp row 4 (64..79)
+  const dripPx = im.px[(40 * 2) * 128 + (32 * 2)];
+  assert.ok(dripPx >= 4 * 16 && dripPx < 5 * 16, `blood drip painted downward at 32,40 (got idx=${dripPx})`);
+  // Hatch in=shadow skipped bright grey:14 half at (10,6) -> stayed grey:14 (idx 14), shaded dark side < 2
+  assert.equal(im.px[(6 * 2) * 128 + (10 * 2)], 14, 'hatch in=shadow preserved bright grey:14 half');
+  assert.ok(im.px[(6 * 2) * 128 + (6 * 2)] < 2, 'hatch in=shadow darkened grey:2 half');
+}
+
 fs.rmSync(SCRATCH, { recursive: true, force: true });
 console.log('ALL TESTS PASSED!');
