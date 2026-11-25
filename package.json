@@ -1,0 +1,16 @@
+{
+  "name": "paltex",
+  "version": "1.0.0",
+  "description": "Palette-first 8-bit indexed pixel-art texture CLI tool with parallel height map, directional lighting, painterly brushes, and CSG 2D shapes.",
+  "type": "module",
+  "bin": {
+    "paltex": "./paltex.mjs"
+  },
+  "scripts": {
+    "test": "node tests/test_paltex.mjs",
+    "check": "node --check paltex.mjs"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}

@@ -1,6 +1,6 @@
 # `paltex` — Ferramenta de Texturas em Pixel Art Indexada para Terminal e LLMs
 
-`paltex` ([`paltex (1).mjs`](file:///C:/Users/j/Desktop/paltex/paltex%20(1).mjs)) é uma ferramenta CLI em Node.js (`>= 16`, zero dependências externas) para criar texturas ilustradas e materiais tileáveis no estilo da era **Quake 1 / Doom 2 / Chasm**.
+`paltex` ([`paltex.mjs`](paltex.mjs)) é uma ferramenta CLI em Node.js (`>= 16`, zero dependências externas) para criar texturas ilustradas e materiais tileáveis no estilo da era **Quake 1 / Doom 2 / Chasm**.
 
 Todo pixel do canvas é um **índice de paleta 8-bit (`0..255`)**: nenhuma operação gera cores fora da paleta. Além do canal de cor, a ferramenta possui um **canal de altura paralelo (`height`)**, iluminação direcional (`light`), camadas (`layer`), simetria (`sym`), sprites por degrau de rampa, hachuras (`hatch`), pincel de cerdas (`bristle`) e diagnóstico (`--trace`, `diff`, `lint`).
 
@@ -25,21 +25,24 @@ Todo pixel do canvas é um **índice de paleta 8-bit (`0..255`)**: nenhuma opera
 
 ```bash
 # Ajuda geral ou de um comando específico
-node "paltex (1).mjs" help
-node "paltex (1).mjs" help light
+node paltex.mjs help
+node paltex.mjs help light
 
 # Executar um arquivo de script .ptx
-node "paltex (1).mjs" textura.ptx
+node paltex.mjs textura.ptx
 
 # Executar via stdin (ideal para LLMs / pipelines)
-node "paltex (1).mjs" - <<'EOF'
+node paltex.mjs - <<'EOF'
 new 64 64 stone:4
 ellipse 32 32 16 16 bone:8 fill
 save out.png scale=4
 EOF
 
 # Executar salvando recortes ampliados de cada comando que alterar pixels
-node "paltex (1).mjs" textura.ptx --trace ./trace_dir --trace-scale 4 --trace-pad 4
+node paltex.mjs textura.ptx --trace ./trace_dir --trace-scale 4 --trace-pad 4
+
+# Rodar a suíte de testes
+npm test
 ```
 
 ### Opções de Linha de Comando para `--trace`
@@ -73,7 +76,7 @@ Qualquer argumento `<color>` aceita:
 ### Escopo (`mask=`, `shape=` e `region=`)
 Praticamente todo comando de desenho, altura, iluminação ou filtro aceita:
 - `mask=<lista>`: restringe o comando às cores especificadas (ex.: `mask=stone,rust:3,@a`). O nome de uma rampa seleciona **todos os seus degraus**. Prefixo `!` inverte a máscara (ex.: `mask=!slate:2`).
-- `shape=<nome>`: restringe o comando à máscara booleana 2D criada com `shape` (ex.: `shape=skull`, ou `shape=!skull` para inverter).
+- `shape=<expr>`: restringe o comando à máscara booleana 2D criada com `shape`, aceitando expressões booleanas inline com `!`, `&`, `|` e parênteses (ex.: `shape=skull`, `shape=!skull`, `shape=skull&!eyes`, `shape=(cranium|horns)&!socket`).
 - `region=x,y,w,h` ou `region=anchor:<nome>[,w[,h]]`: restringe a uma janela retangular ou caixa centrada em uma âncora (com suporte a wrap).
 - Todos são avaliados sobre um **snapshot tirado antes do comando começar**, então `noise`, `light` ou `stroke +2` nunca interferem nas próprias leituras durante o mesmo passo.
 
@@ -89,7 +92,7 @@ Praticamente todo comando de desenho, altura, iluminação ou filtro aceita:
 | --- | --- |
 | `palette` | Lista todas as cores (`*` indica fullbright) e as rampas atuais. |
 | `palette builtin` | Paleta padrão `grime`: 16 rampas × 16 degraus (`grey`, `dirt`, `stone`, `moss`, `rust`, `brick`, `flesh`, `blood`, `slime`, `water`, `steel`, `brass`, `bone`, `lava`, `purple`, `teal`). |
-| `palette quake [arquivo.lmp]` | Sem arquivo, gera uma paleta original de 256 cores no layout do Quake 1 (14 rampas de material + `fb_warm` `224..239` + `fb_cool` `240..254`, marcando `224..255` como fullbright). Com caminho `.lmp`, carrega a paleta real e aplica as rampas Quake + fullbrights. |
+| `palette quake [arquivo.lmp]` | Sem arquivo, gera uma paleta original de 256 cores no layout do Quake 1 (14 rampas de material + alias `bone` + 4 rampas fullbright separadas `fb_lava`, `fb_fire`, `fb_plasma`, `fb_runic`, além dos aliases `fb_warm`/`fb_cool`, marcando `224..255` como fullbright). Com caminho `.lmp`, carrega a paleta real e aplica as rampas Quake + fullbrights. |
 | `palette fullbright <idx\|a..b...\|clear>` | Marca índices como **fullbright** (ou limpa). |
 | `palette file <caminho>` | Carrega `.png`, `.gpl`, `.pal` (JASC), lista hex ou RGB bruto (`palette.lmp`, `PLAYPAL`). |
 | `palette set <#hex> ...` | Define paleta customizada. |
@@ -99,7 +102,7 @@ Praticamente todo comando de desenho, altura, iluminação ou filtro aceita:
 ### Como funciona `fullbright`
 Índices marcados como fullbright (como `224..254` em `palette quake`, ideais para olhos brilhantes, lava e runas):
 1. **Não são escurecidos nem clareados** por `light`, `bevel`, `cavity`, `grad shade/tint`, `noise shade/tint`, `hatch` relativo, `stamp ... shade` ou `layer merge mode=shade`.
-2. **São excluídos** da busca automática de [`nearest()`](file:///C:/Users/j/Desktop/paltex/paltex%20(1).mjs#L185-L198) (`#hex` e `import` sem lista explícita de rampas), evitando que áreas comuns acabem usando cores brilhantes por acidente.
+2. **São excluídos** da busca automática de [`nearest()`](paltex.mjs#L210-L235) (`#hex` e `import` sem lista explícita de rampas), evitando que áreas comuns acabem usando cores brilhantes por acidente.
 
 ---
 
@@ -275,7 +278,8 @@ sym off
 - Modos: `off`, `x`, `y`, `xy`.
 - `axis=N`, `ax,ay` ou âncora (ex.: `axis=skull` ou `axis=cx-0.5`; omitido usa o centro `(w-1)/2`).
 - `jitter=N` aplica pequena assimetria suave por traço/comando (sem fragmentar linhas).
-- Espelha comandos geométricos (`pixel`, `line`, `rect`, `ellipse`, `poly`, `flood`, `stroke`, `curve`, `spline`, `stamp`) sem corromper filtros direcionais como `light`, `bevel` ou `noise`.
+- Espelha comandos geométricos (`pixel`, `line`, `rect`, `ellipse`, `poly`, `flood`, `stroke`, `curve`, `spline`, `stamp`, `shape`) sem corromper filtros direcionais como `light`, `bevel` ou `noise`.
+- Também pode ser passado inline em um único comando (`sym=x|y|xy|off [axis=...]`) sem alterar o estado global seguinte.
 
 ### Camadas (`layer`)
 - `layer new [nome] [shade]`: cria camada transparente acima da atual (ou uma camada `shade` que acumula deltas `+n/-n` sem destruir os materiais abaixo).
@@ -310,7 +314,7 @@ sym off
 - `masonry <ramp> [style=running|grid|ashlar] [w=32 h=16 | cols=N rows=N] [mortar=2] [mortar_color=<c>] [bevel=3] [height=5] [vary=2] [tilt=1] [rough=1.8] [chip=35] [rivets] [seed=N]` — gera alvenaria/blocos sem costuras escrevendo cor + relevo orgânico chanfrado por bloco no canal de altura.
 - `plates <ramp> [w=32 h=32 | cols=N rows=N] [mortar=1] [bevel=2] [height=4] [vary=1] [tilt=1] [rivets] [seed=N]` — atalho para chapas metálicas rebitadas.
 - `glow` / `emit` `[mask=<emissores>] [radius=6] [ramp=<nome>] [strength=75] [mode=mix|rgb|tint|shade] [dither=bayer4] [normal] [ramps=a,b]` — projeta luz local ao redor de pixels fullbright (ou da `mask=`), opcionalmente modulada pelas normais de `height` (`normal`).
-- `grad <ramp|shade> <x0> <y0> <x1> <y1> [from=a to=b] [dither=...] [shape=radial] [tint [prob=P]]`
+- `grad <ramp|shade> <x0> <y0> <x1> <y1> [from=a to=b] [dither=...] [mode=linear|radial] [radial] [tint [prob=P]]` *(use `mode=radial` ou `radial` para poder combinar livremente com `shape=<expr>`)*
 - `noise <ramp|shade> [type=value|turbulence|ridged|voronoi|cracks|cells] [scale=N|scalex=N scaley=N] [octaves=1..6] [warp=N] [from=a to=b] [contrast=%] [bias=%] [seed=N] [tint [prob=P]]`
 - `dfill <color> <pct> [bayer=2|4|8 | noise=SEED]` *(emite aviso se usar `bayer=2` em `>= 256 px`)*
 - `rough mask=<shape> [amount=1..8] [prob=P] [side=both|in|out] [clump=1..32] [seed=N]`

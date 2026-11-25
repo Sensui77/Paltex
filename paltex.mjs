@@ -163,8 +163,18 @@ function applyQuakeRamps() {
     const idx = Array.from({ length: 16 }, (_, j) => base + j).sort((p, q) => lum(S.pal[p]) - lum(S.pal[q]));
     setRamp(name, idx);
   });
-  setRamp('fb_warm', Array.from({ length: 16 }, (_, j) => 224 + j).sort((p, q) => lum(S.pal[p]) - lum(S.pal[q])));
-  setRamp('fb_cool', Array.from({ length: 15 }, (_, j) => 240 + j).sort((p, q) => lum(S.pal[p]) - lum(S.pal[q])));
+  let fbPos = 224;
+  for (const [name, , count] of QUAKE_FULLBRIGHT) {
+    const block = Array.from({ length: count }, (_, j) => fbPos + j).sort((p, q) => lum(S.pal[p]) - lum(S.pal[q]));
+    setRamp(name, block);
+    fbPos += count;
+  }
+  const g = S.ramps.get('grey'), br = S.ramps.get('brown'), md = S.ramps.get('mud');
+  const boneIdx = [...new Set([g[0], br[1], md[2], md[4], md[5], md[7], md[8], md[10], md[11], br[11], md[13], md[14], md[15], g[12], g[13], g[15]])]
+    .sort((p, q) => lum(S.pal[p]) - lum(S.pal[q]));
+  setRamp('bone', boneIdx, { alias: true });
+  setRamp('fb_warm', Array.from({ length: 16 }, (_, j) => 224 + j).sort((p, q) => lum(S.pal[p]) - lum(S.pal[q])), { alias: true });
+  setRamp('fb_cool', Array.from({ length: 15 }, (_, j) => 240 + j).sort((p, q) => lum(S.pal[p]) - lum(S.pal[q])), { alias: true });
   setFullbright(Array.from({ length: 31 }, (_, j) => 224 + j));
   S.fullbright[255] = 1;
 }
@@ -454,22 +464,46 @@ function symJitter(salt = 0) {
   ];
 }
 const regionOf = (o) => { const R = o.region || [0, 0, S.w, S.h]; return S.wrap ? [R[0], R[1], Math.min(R[2], S.w), Math.min(R[3], S.h)] : R; };
-// scope = region=x,y,w,h AND mask=colors AND shape=name, tested against a snapshot taken before the command runs.
+function evalShapeExpr(expr) {
+  const raw = String(expr).trim();
+  if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(raw)) return S.shapes.get(raw) || fail(`unknown shape "${raw}" (use "shape new ${raw}" first)`);
+  const toks = raw.match(/[A-Za-z_][A-Za-z0-9_]*|[!&|()]/g);
+  if (!toks || toks.join('') !== raw.replace(/\s+/g, '')) fail(`bad shape expression "${expr}"`);
+  let p = 0;
+  const n = S.w * S.h;
+  const parseOr = () => {
+    let v = parseAnd();
+    while (toks[p] === '|') { p++; const r = parseAnd(); for (let i = 0; i < n; i++) v[i] = v[i] || r[i] ? 1 : 0; }
+    return v;
+  };
+  const parseAnd = () => {
+    let v = parseUnary();
+    while (toks[p] === '&') { p++; const r = parseUnary(); for (let i = 0; i < n; i++) v[i] = v[i] && r[i] ? 1 : 0; }
+    return v;
+  };
+  const parseUnary = () => {
+    if (toks[p] === '!') { p++; const r = parseUnary(); for (let i = 0; i < n; i++) r[i] ^= 1; return r; }
+    if (toks[p] === '(') {
+      p++;
+      const r = parseOr();
+      if (toks[p] !== ')') fail(`unclosed "(" in shape expression "${expr}"`);
+      p++;
+      return r;
+    }
+    const nm = toks[p++];
+    if (!nm || /^[!&|()]$/.test(nm)) fail(`unexpected token "${nm ?? 'end'}" in shape expression "${expr}"`);
+    const buf = S.shapes.get(nm) || fail(`unknown shape "${nm}" (use "shape new ${nm}" first)`);
+    return buf.slice();
+  };
+  const res = parseOr();
+  if (p < toks.length) fail(`unexpected token "${toks[p]}" in shape expression "${expr}"`);
+  return res;
+}
+// scope = region=x,y,w,h AND mask=colors AND shape=expr, tested against a snapshot taken before the command runs.
 function scope(o) {
   const src = S.px.slice(), R = o.region, M = o.mask;
-  let SB = null, SInv = false;
-  if (o.shape && o.shape !== 'radial' && o.shape !== 'linear') {
-    const raw = String(o.shape);
-    SInv = raw[0] === '!';
-    const nm = SInv ? raw.slice(1) : raw;
-    SB = S.shapes.get(nm) || fail(`unknown shape "${nm}" (use "shape new ${nm}" first)`);
-  }
-  const inS = (x, y) => {
-    if (!SB) return true;
-    if (!S.wrap && (x < 0 || y < 0 || x >= S.w || y >= S.h)) return SInv;
-    const v = SB[mod(y, S.h) * S.w + mod(x, S.w)] === 1;
-    return SInv ? !v : v;
-  };
+  const SB = o.shape && o.shape !== 'radial' && o.shape !== 'linear' ? evalShapeExpr(o.shape) : null;
+  const inS = (x, y) => !SB || (S.wrap ? SB[mod(y, S.h) * S.w + mod(x, S.w)] === 1 : x >= 0 && y >= 0 && x < S.w && y < S.h && SB[y * S.w + x] === 1);
   const inR = (x, y) => !R || (S.wrap ? mod(x - R[0], S.w) < R[2] && mod(y - R[1], S.h) < R[3] : x >= R[0] && y >= R[1] && x < R[0] + R[2] && y < R[1] + R[3]);
   const has = (x, y) => { const c = get(x, y, src); return c >= 0 && inR(x, y) && inS(x, y) && (!M || M[c] === 1); };
   const each = (fn) => {
@@ -1129,11 +1163,12 @@ function grad(target, x0, y0, x1, y1, o) {
   if (o.tint && rel) fail('grad: tint requires a target ramp, not "shade"');
   const a = num(o.from, rel ? -2 : 0, 'from'), b = num(o.to, rel ? 2 : r.length - 1, 'to');
   const dx = x1 - x0, dy = y1 - y0, L = dx * dx + dy * dy || 1, D = ditherOpt(o.dither || 'bayer4'), sc = scope(o), Q = quantizer(D, regionOf(o)[2]);
+  const isRadial = !!o.radial || o.mode === 'radial' || o.shape === 'radial';
   const hasProb = o.prob !== undefined, prob = num(o.prob, 50, 'prob');
   if (prob < 0 || prob > 100) fail('prob must be 0..100');
   sc.each((x, y, c, i, j) => {
     if ((rel || o.tint) && S.fullbright[c]) return;
-    const u = clamp(o.shape === 'radial' ? Math.sqrt(((x - x0) ** 2 + (y - y0) ** 2) / L) : ((x - x0) * dx + (y - y0) * dy) / L, 0, 1);
+    const u = clamp(isRadial ? Math.sqrt(((x - x0) ** 2 + (y - y0) ** 2) / L) : ((x - x0) * dx + (y - y0) * dy) / L, 0, 1);
     if (o.tint) {
       if (Q(hasProb ? tintCoverage(u, prob) : u, x, y, i, j) >= 1) {
         put(x, y, r[clamp(Math.round(a + (b - a) * brightnessOf(c)), 0, r.length - 1)]);
@@ -1714,11 +1749,12 @@ function heightCmd(a, o) {
     return;
   }
   if (sub === 'grad') {
-    const [x0, y0, x1, y1] = [coord(a[1], 'x0', 'x'), coord(a[2], 'y0', 'y'), coord(a[3], 'x1', 'x'), coord(a[4], 'y1', 'y')];
+    const [x0, y0, x1, y1] = [coordf(a[1], 'x0', 'x'), coordf(a[2], 'y0', 'y'), coordf(a[3], 'x1', 'x'), coordf(a[4], 'y1', 'y')];
     const lo = fnum(o.from, 0, 'from'), hi = fnum(o.to, 4, 'to'), dx = x1 - x0, dy = y1 - y0, L = dx * dx + dy * dy || 1;
+    const isRadial = !!o.radial || o.mode === 'radial' || o.shape === 'radial';
     const sc = scope(o);
     sc.each((x, y) => {
-      const u = clamp(o.shape === 'radial' ? Math.sqrt(((x - x0) ** 2 + (y - y0) ** 2) / L) : ((x - x0) * dx + (y - y0) * dy) / L, 0, 1);
+      const u = clamp(isRadial ? Math.sqrt(((x - x0) ** 2 + (y - y0) ** 2) / L) : ((x - x0) * dx + (y - y0) * dy) / L, 0, 1);
       writeH(mod(y, S.h) * S.w + mod(x, S.w), lo + (hi - lo) * u);
     });
     return;
@@ -1759,7 +1795,7 @@ function heightCmd(a, o) {
     return;
   }
   if (sub === 'stroke' || sub === 'curve' || sub === 'spline') {
-    const val = float(need(a[1], 'val'), 'val'), rawPts = ptsOf(a.slice(2), sub === 'curve' ? 3 : sub === 'spline' ? 2 : 1, `height ${sub}`);
+    const val = float(need(a[1], 'val'), 'val'), rawPts = ptsOf(a.slice(2), sub === 'curve' ? 3 : sub === 'spline' ? 2 : 1, `height ${sub}`, true);
     const pts = sub === 'stroke' ? (o.closed && rawPts.length >= 2 ? [...rawPts, rawPts[0]] : rawPts) : evalCurve(rawPts, !!o.closed, sub === 'spline');
     const sz = clamp(fnum(o.size, 3, 'size'), 1, 128), tp = parseTaper(o.taper, [100, 100]);
     const sc = scope(o), weights = new Map();
@@ -2145,7 +2181,7 @@ function rasterShapeMask(rest, o) {
   } else if (kind === 'poly') {
     poly(P, ptsOf(args, 3, 'shape poly'), true);
   } else if (kind === 'stroke' || kind === 'curve' || kind === 'spline') {
-    const rawPts = ptsOf(args, kind === 'curve' ? 3 : kind === 'spline' ? 2 : 1, `shape ${kind}`);
+    const rawPts = ptsOf(args, kind === 'curve' ? 3 : kind === 'spline' ? 2 : 1, `shape ${kind}`, true);
     const pts = kind === 'stroke' ? (o.closed && rawPts.length >= 2 ? [...rawPts, rawPts[0]] : rawPts) : evalCurve(rawPts, !!o.closed, kind === 'spline');
     const sz = clamp(fnum(o.size, S.brushOn ? S.brush.size : 3, 'size'), 1, 128), tp = parseTaper(o.taper, [100, 100]);
     for (const [x, y, t] of samplePath(pts)) {
@@ -2442,17 +2478,26 @@ function lintCanvas(o) {
     if (c === c2x && c === c2y && c1x >= 0 && c1y >= 0 && (c1x !== c || c1y !== c) && c1x === cAt(x + 3, y) && c1y === cAt(x, y + 3)) {
       ditherMask[idx] = 1;
     }
-    // 2. Intra-ramp jumps > jumpLim (only check E and S to count each edge once)
-    if (rm) {
+    // 2. Intra-ramp jumps > jumpLim (skip fullbright pixels and sharp sculpted height boundaries)
+    const ch = S.hchanged > 0 ? getH(x, y) : 0;
+    if (rm && !S.fullbright[c]) {
       for (const [dx, dy] of [[1, 0], [0, 1]]) {
         const nc = cAt(x + dx, y + dy), rn = nc >= 0 ? S.rampOf[nc] : null;
-        if (rn && rn.name === rm.name && Math.abs(rm.i - rn.i) > jumpLim) jumps.push([wx, wy, Math.abs(rm.i - rn.i)]);
+        if (!rn || rn.name !== rm.name || S.fullbright[nc] || Math.abs(rm.i - rn.i) <= jumpLim) continue;
+        if (S.hchanged > 0 && Math.abs(ch - getH(x + dx, y + dy)) >= 1.5) continue;
+        jumps.push([wx, wy, Math.abs(rm.i - rn.i)]);
       }
     }
-    // 3. Isolated single-pixel noise (not part of regular checkerboard or thin 1px line)
+    // 3. Isolated single-pixel noise (not part of regular checkerboard, thin 1px line, or convex height peak specular)
     if (!S.fullbright[c] && !(c1x === cAt(x - 1, y) && c1y === cAt(x, y - 1))) {
-      let allFar = true;
+      let isPeak = false;
+      if (S.hchanged > 0) {
+        const avgH = (getH(x + 1, y) + getH(x - 1, y) + getH(x, y + 1) + getH(x, y - 1)) / 4;
+        if (ch - avgH >= 1.5) isPeak = true;
+      }
+      let allFar = !isPeak;
       for (const [dx, dy] of N8) {
+        if (!allFar) break;
         const nc = cAt(x + dx, y + dy);
         if (nc < 0) continue;
         if (nc === c) { allFar = false; break; }
@@ -2559,7 +2604,7 @@ def('palette', '[builtin | quake [file] | fullbright <idx|a..b...|clear> | file 
   if (a[0] === 'builtin') builtinPalette();
   else if (a[0] === 'quake') {
     quakePalette(a[1]);
-    out(`palette: Quake-layout ${S.pal.length} colors (${a[1] || 'built-in'}), ${S.ramps.size} ramps, fullbright 224..254`);
+    out(`palette: Quake-layout ${S.pal.length} colors (${a[1] || 'built-in'}), ${S.ramps.size} ramps, fullbrights: fb_lava/fb_fire/fb_plasma/fb_runic (224..254)`);
   } else if (a[0] === 'fullbright') {
     needPal();
     if (a[1] === 'clear') { S.fullbright.fill(0); nearCache.clear(); out('fullbright: cleared'); }
@@ -2768,8 +2813,9 @@ def('ellipse', '<cx> <cy> <rx> <ry> <color> [fill]', 'Ellipse (outline or fill) 
   needCanvas();
   ellipse(plotter(o, col(a[4])), coord(a[0], 'cx', 'x'), coord(a[1], 'cy', 'y'), coord(a[2], 'rx', 'x'), coord(a[3], 'ry', 'y'), !!o.fill);
 }, true, ['fill']);
-const ptsOf = (toks, min, what) => {
-  const pts = toks.map((t) => { const p = t.split(','); if (p.length !== 2) fail(`${what}: points are written x,y — got "${t}"`); return [coord(p[0], 'x', 'x'), coord(p[1], 'y', 'y')]; });
+const ptsOf = (toks, min, what, allowFloat = false) => {
+  const fn = allowFloat ? coordf : coord;
+  const pts = toks.map((t) => { const p = t.split(','); if (p.length !== 2) fail(`${what}: points are written x,y — got "${t}"`); return [fn(p[0], 'x', 'x'), fn(p[1], 'y', 'y')]; });
   if (pts.length < min) fail(`${what}: needs at least ${min} point(s)`);
   return pts;
 };
@@ -2779,17 +2825,17 @@ def('poly', '<color> <x,y> <x,y> <x,y> ... [fill]', 'Polygon outline or filled (
 def('flood', '<x> <y> <color> [diag]', 'Flood-fill the contiguous same-color area at x,y (respects mask=/region=).', (a, o) => {
   needCanvas(); flood(coord(a[0], 'x', 'x'), coord(a[1], 'y', 'y'), col(a[2]), o);
 }, true, ['diag']);
-def('stroke', '<color> <x,y> <x,y> ... [closed] [brush opts]', 'Brushed polyline through the points using the active brush.', (a, o) => {
-  needCanvas(); paintPath(ptsOf(a.slice(1), 1, 'stroke'), need(a[0], 'color'), o);
+def('stroke', '<color> <x,y> <x,y> ... [closed] [brush opts]', 'Brushed polyline through the points using the active brush (supports float/anchor coords).', (a, o) => {
+  needCanvas(); paintPath(ptsOf(a.slice(1), 1, 'stroke', true), need(a[0], 'color'), o);
 }, true, ['closed', 'alpha', 'tint']);
 def('curve', '<color> <x,y> <x,y> <x,y> [x,y ...] [closed] [brush opts]', 'Smooth brushed curve: 3 pts = quadratic bezier, 4 = cubic bezier, 5+ = Catmull-Rom spline through the points.', (a, o) => {
   needCanvas();
-  const pts = ptsOf(a.slice(1), 3, 'curve');
+  const pts = ptsOf(a.slice(1), 3, 'curve', true);
   paintPath(evalCurve(pts, !!o.closed, false), need(a[0], 'color'), o, !!o.closed);
 }, true, ['closed', 'alpha', 'tint']);
 def('spline', '<color> <x,y> <x,y> ... [closed] [brush opts]', 'Catmull-Rom spline THROUGH every point (2+ points), optionally closed.', (a, o) => {
   needCanvas();
-  const pts = ptsOf(a.slice(1), 2, 'spline');
+  const pts = ptsOf(a.slice(1), 2, 'spline', true);
   paintPath(evalCurve(pts, !!o.closed, true), need(a[0], 'color'), o, !!o.closed);
 }, true, ['closed', 'alpha', 'tint']);
 def('stamp', '<sprite> <x> <y> [center] [scale=N|PCT%|W,H] [shade | shade=n] [mid=N] [rot=0|90|180|270] [flipx] [flipy] [repeat=nx,ny step=sx,sy]',
@@ -2811,9 +2857,9 @@ def('scatter', '<sprite[,sprite…]> <n> [seed=N] [min=D] [inside] [rot=any|0|90
   const sps = need(a[0], 'sprite').split(',').map((nm) => S.sprites.get(nm) || fail(`no sprite "${nm}"`));
   scatter(sps, int(a[1], 'n'), o);
 }, true, ['flip', 'inside']);
-def('grad', '<ramp|shade> <x0> <y0> <x1> <y1> [from=a to=b] [dither=…] [shape=radial] [tint [prob=P]]', 'Gradient in RAMP STEPS, dithered. "shade" shifts what is already there; a ramp name paints that ramp (tint keeps the underlying lightness).', (a, o) => {
-  needCanvas(); grad(need(a[0], 'ramp|shade'), coord(a[1], 'x0', 'x'), coord(a[2], 'y0', 'y'), coord(a[3], 'x1', 'x'), coord(a[4], 'y1', 'y'), o);
-}, true, ['tint']);
+def('grad', '<ramp|shade> <x0> <y0> <x1> <y1> [from=a to=b] [dither=…] [mode=linear|radial] [radial] [tint [prob=P]]', 'Gradient in RAMP STEPS, dithered. "shade" shifts what is already there; a ramp name paints that ramp (tint keeps the underlying lightness).', (a, o) => {
+  needCanvas(); grad(need(a[0], 'ramp|shade'), coordf(a[1], 'x0', 'x'), coordf(a[2], 'y0', 'y'), coordf(a[3], 'x1', 'x'), coordf(a[4], 'y1', 'y'), o);
+}, true, ['tint', 'radial']);
 def('noise', '<ramp|shade> [type=value|turbulence|ridged|voronoi|cracks|cells] [scale=N|scalex=N scaley=N] [octaves=1..6] [warp=N] [from=a to=b] [contrast=%] [bias=%] [seed=N] [tint [prob=P]]', 'Tileable noise field mapped to ramp steps (like grad, but noisy). Great for stone grain, rust, moss, cloudy dirt.', (a, o) => {
   needCanvas(); noiseField(need(a[0], 'ramp|shade'), o);
 }, true, ['tint']);
@@ -2826,9 +2872,9 @@ def('smudge', '[radius=N] [strength=%] [dir=x|y|d1|d2|n|s|e|w…] [len=N] [passe
 def('cavity', '[mask=<shape>] [against=<colors>] [radius=1..6] [lo=N] [min=%] [dither=…] [seed=N]', 'Ambient occlusion / contact shadow: darkens pixels crowded by what is outside the shape (or by "against" colors).', (a, o) => { needCanvas(); cavity(o); }, true);
 def('bevel', '[mask=<shape>] [region=x,y,w,h] [light=n|ne|e|se|s|sw|w|nw] [depth=N] [hi=N] [lo=N] [soft]', 'Edge lighting: edges facing the light get +hi ramp steps, edges facing away -lo. soft fades one step per pixel inward.', (a, o) => { needCanvas(); bevel(o); }, true, ['soft']);
 def('height', 'inflate|bevel|add|set|scale|grad|noise|blur|from|rect|ellipse|poly|stroke|curve|spline|clear ...',
-  'Sculpt the parallel height channel (e.g. "height inflate", "height bevel depth=3", "height stroke -4 10,10 20,20 size=3 soft", "height grad 0 0 0 32 from=4 to=0").', (a, o) => {
+  'Sculpt the parallel height channel (e.g. "height inflate", "height bevel depth=3", "height stroke -4 10,10 20,20 size=3 soft", "height grad 0 0 0 32 from=4 to=0 [radial]").', (a, o) => {
   needCanvas(); heightCmd(a, o);
-}, false, ['bleed', 'fill', 'soft', 'ridge', 'closed']);
+}, false, ['bleed', 'fill', 'soft', 'ridge', 'closed', 'radial']);
 def('masonry', '<ramp> [style=running|grid|ashlar] [w=32 h=16 | cols=N rows=N] [mortar=2] [mortar_color=<c>] [bevel=3] [height=5] [vary=2] [tilt=1] [rough=1.8] [chip=35] [rivets] [seed=N]',
   'Generate seamless beveled stone blocks or plates (writes organic edges, color, and height per block).', (a, o) => {
   needCanvas(); masonryCmd(need(a[0], 'ramp'), o, false);
@@ -2901,7 +2947,7 @@ def('save', '<file.png> [scale=N] [tile=N]', 'Write an indexed 8-bit PNG (palett
 });
 
 // ─────────────────────────────────────────────────────────────── option parser, script runner, CLI
-const KNOWN = new Set('against all alpha amount angle angle_jitter ao ao_radius aspect axis bayer bevel bias bleed blend bristles brush center chip clump cols contrast cross density depth dir dither elev face fill flow flow_jitter follow from gloss h height hi jitter jump len light lo mask mid min mode mortar mortar_color n noise normal octaves opacity outline pad passes prob profile protect radius ramp ramps range region repeat ridge rivets rot rough round rows scale scalex scaley scatter seed shade shade_jitter shadow shape side size size_jitter skip soft spacing spec spread step strength style taper tex_scale tile tilt tint to type vary view w warp'.split(' '));
+const KNOWN = new Set('against all alpha amount angle angle_jitter ao ao_radius aspect axis bayer bevel bias bleed blend bristles brush center chip clump cols contrast cross density depth dir dither elev face fill flow flow_jitter follow from gloss h height hi jitter jump len light lo mask mid min mode mortar mortar_color n noise normal octaves opacity outline pad passes prob profile protect radial radius ramp ramps range region repeat ridge rivets rot rough round rows scale scalex scaley scatter seed shade shade_jitter shadow shape side size size_jitter skip soft spacing spec spread step strength style sym taper tex_scale tile tilt tint to type vary view w warp'.split(' '));
 const parseRegion = (v) => {
   const s = String(v);
   if (s.startsWith('anchor:')) {
@@ -3043,7 +3089,16 @@ function runScript(text, label = 'script') {
       const beforePx = (cmd.draw || isShapeDraw || (name === 'layer' && a[0] && a[0] !== 'list')) && S.w ? S.px.slice() : null;
       const before = S.changed, hBefore = S.hchanged;
       S.cmdSeq++;
-      cmd.fn(a, o);
+      const prevSym = (name !== 'sym' && o.sym !== undefined) ? { ...S.sym } : null;
+      if (prevSym) {
+        if (!['off', 'x', 'y', 'xy'].includes(o.sym)) fail('sym= must be off | x | y | xy');
+        S.sym.mode = o.sym;
+        if (o.axis !== undefined && name !== 'shape') {
+          const [ax, ay] = parseAxisOpt(o.axis, S.sym.ax, S.sym.ay);
+          S.sym.ax = ax; S.sym.ay = ay;
+        }
+      }
+      try { cmd.fn(a, o); } finally { if (prevSym) S.sym = prevSym; }
       nCmd++;
       if (beforePx) {
         S.lastDiff = { px: beforePx, cmd: toks.join(' ').slice(0, 60) };
